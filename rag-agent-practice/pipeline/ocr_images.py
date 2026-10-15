@@ -8,10 +8,36 @@
 - 표: 레이아웃 모델(PP-DocLayoutV3)로 표 영역을 찾고 표 구조 모델(SLANet+)로 행·열을 복원해
   마크다운 표로 넣는다. 1행/1열이거나 데이터 칸이 절반 넘게 비면(구조 인식 실패) 일반 OCR 텍스트로 둔다
 
+흐름
+    main()
+     ├─ jsonl 파일마다 병렬로 process_file()
+     │   └─ process_file(): 페이지의 이미지 블록 중 대상만 처리
+     │       대상 = (needs_vision 이고 아직 OCR 안 한 블록) + (OCR은 했는데 표 감지는 안 한 블록)
+     │       ├─ 이미 OCR한 블록: 저장된 PNG로 find_image_tables()만 돌려서
+     │       │                    표가 없으면 그대로 두고, 표가 있으면 ocr_region()으로 다시 처리
+     │       └─ 새 블록: ocr_region()
+     │           [1] 영역을 200dpi로 렌더링 -> PNG 저장 (output/extracted/images/)
+     │           [2] find_image_tables(): 레이아웃 모델로 표 영역 찾기 -> 표만 잘라 OCR
+     │               -> 표 구조 모델로 행·열 복원(html_to_rows) -> 1행/1열·빈칸 많은 표 거르기
+     │           [3] 이미지 전체 OCR -> 글상자를 PDF 좌표로 변환
+     │               (표 안 글상자, 이미 PDF 글자로 읽힌 글상자, 신뢰도 낮은 글상자는 버림)
+     │           [4] 2단 감지(layout_from_words) -> 읽기 순서 정렬 -> 같은 줄 글상자 잇기
+     │           [5] 표를 원래 위치에 마크다운으로 끼워 넣어 하나의 텍스트로 반환
+     │       -> 결과를 블록에 저장 (text, ocr_stats, ocr_tables, needs_vision 갱신)
+     │          글자를 못 찾았거나 평균 신뢰도 0.8 미만이면 needs_vision=True (Gemini 대상)
+     │       -> JSONL 파일 통째로 다시 쓰기 (tmp 파일에 쓰고 교체)
+     └─ 미리보기·INDEX 다시 생성
+
 실행
-    python ocr_images.py               # 전체 (이미 OCR한 블록은 표 감지만 추가로 한다)
-    python ocr_images.py --only luxury # 파일명 일부로 골라서
+    python -m pipeline.ocr_images               # 전체 (이미 OCR한 블록은 표 감지만 추가로 한다)
+    python -m pipeline.ocr_images --only luxury # 파일명 일부로 골라서
 """
+
+import sys
+from pathlib import Path
+
+# pipeline 폴더 안에서 python 파일명.py 로 바로 실행해도 pipeline 패키지를 찾게 한다
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
@@ -24,7 +50,7 @@ import pdfplumber
 from bs4 import BeautifulSoup
 from PIL import Image
 
-from extract import (DATA_DIR, JSONL_DIR, OUT_DIR, inside, is_real_table, layout_from_words,
+from pipeline.extract import (DATA_DIR, JSONL_DIR, OUT_DIR, inside, is_real_table, layout_from_words,
                      load_records, markdown_row, reading_key, write_index, write_preview)
 
 IMAGES_DIR = OUT_DIR / "images"
@@ -43,6 +69,7 @@ _table = None
 
 
 def get_engine():
+    """RapidOCR(PP-OCRv5 한국어) 엔진. 프로세스마다 한 번만 만든다."""
     # 프로세스마다 한 번만 모델을 올린다
     global _engine
     if _engine is None:
@@ -61,6 +88,7 @@ def get_engine():
 
 
 def get_table_models():
+    """레이아웃 모델(표 영역 찾기)과 표 구조 모델(행·열 복원). 프로세스마다 한 번만 만든다."""
     global _layout, _table
     if _layout is None:
         from rapid_layout import RapidLayout
@@ -137,13 +165,16 @@ def find_image_tables(img, bbox, page_chars):
 
 def ocr_region(page, bbox, png_path, page_chars, image=None):
     """bbox 영역을 렌더링·저장하고 OCR한다. 읽기 순서로 정렬한 텍스트(표는 마크다운)와 통계를 반환."""
+    # [1] 렌더링·PNG 저장 (이미 저장된 PNG를 받으면 그대로 쓴다)
     if image is None:
         image = page.crop(bbox).to_image(resolution=DPI).original.convert("RGB")
         png_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(png_path)
     img = np.array(image)
 
+    # [2] 이미지 속 표 찾기·복원
     tables = find_image_tables(img, bbox, page_chars)
+    # [3] 이미지 전체 OCR
     res = get_engine()(img)
     boxes = res.boxes if res.boxes is not None else []
     if not len(boxes) and not tables:
@@ -170,7 +201,7 @@ def ocr_region(page, bbox, png_path, page_chars, image=None):
         words.append({"x0": wb[0], "top": wb[1], "x1": wb[2], "bottom": wb[3],
                       "text": txt.strip(), "score": float(score)})
 
-    # 2단 감지 후 읽기 순서로 정렬하고, 같은 줄의 글상자는 공백으로 잇는다
+    # [4] 2단 감지 후 읽기 순서로 정렬하고, 같은 줄의 글상자는 공백으로 잇는다
     layout = layout_from_words(words, bbox, min_words=10)
     key = lambda w: reading_key((w["x0"], w["top"], w["x1"], w["bottom"]), layout)
     words.sort(key=key)
@@ -186,7 +217,7 @@ def ocr_region(page, bbox, png_path, page_chars, image=None):
                 continue
         lines.append(dict(w))
 
-    # 표를 원래 위치(읽기 순서)에 끼워 넣는다
+    # [5] 표를 원래 위치(읽기 순서)에 끼워 넣는다
     for t in tables:
         x0, top, x1, bottom = t["bbox"]
         lines.append({"x0": x0, "top": top, "x1": x1, "bottom": bottom, "text": t["text"], "table": True})
@@ -205,6 +236,7 @@ def ocr_region(page, bbox, png_path, page_chars, image=None):
 
 
 def process_file(jsonl_file):
+    """jsonl 하나의 이미지 블록들을 OCR(+표 인식)하고 파일을 다시 쓴다. (파일명, 처리 수, 표 수) 반환."""
     records = load_records(jsonl_file)
     first = records[0]
     pdf_path = DATA_DIR / first["domain"] / first["file_name"]
@@ -261,6 +293,7 @@ def process_file(jsonl_file):
 
 
 def main():
+    """jsonl 파일 목록 -> 병렬 OCR -> 미리보기·INDEX 갱신"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--only")
     parser.add_argument("--workers", type=int, default=4)

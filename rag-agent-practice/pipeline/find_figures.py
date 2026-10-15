@@ -8,9 +8,30 @@
 - OCR 실패 영역(needs_vision=True)은 블록 전체를 대상으로 하고, 그 안의 영역은 중복이라 뺀다
 - 결과: output/extracted/figures/targets.jsonl + 영역별 PNG
 
+흐름
+    main()
+     ├─ jsonl 파일마다 병렬로 find_in_file()
+     │   └─ 페이지마다 (빈 페이지 제외)
+     │       [1] OCR 실패 이미지 블록(needs_vision)은 블록 전체를 'ocr_failed' 대상으로 추가
+     │       [2] 본문 영역을 150dpi로 렌더링 -> 레이아웃 모델로 영역 분류(chart / image / table ...)
+     │       [3] 영역마다 거르기
+     │           - 너무 작은 영역(2% 미만), 이미 ocr_failed에 포함된 영역은 제외
+     │           - table: PDF 글자로 읽힌 표, 이미지 표 중 구조 인식이 잘 된 표는 제외 -> 나머지 'table'
+     │           - chart : 모두 'chart'
+     │           - image : 글자 상자 4개 이상이면 'diagram', 아니면 사진·로고라 제외
+     │           - 이미 잡힌 대상과 많이 겹치면(IoU 0.5 초과) 제외
+     │       [4] 대상마다 figure_id 부여, 200dpi PNG 저장 (ocr_failed는 기존 PNG 재사용)
+     └─ 전체 대상을 targets.jsonl에 저장 -> 다음 단계 vision_gemini.py가 읽는다
+
 실행
-    python find_figures.py
+    python -m pipeline.find_figures
 """
+
+import sys
+from pathlib import Path
+
+# pipeline 폴더 안에서 python 파일명.py 로 바로 실행해도 pipeline 패키지를 찾게 한다
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
@@ -20,7 +41,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pdfplumber
 
-from extract import DATA_DIR, JSONL_DIR, MARGIN, OUT_DIR, inside, load_records
+from pipeline.extract import DATA_DIR, JSONL_DIR, MARGIN, OUT_DIR, inside, load_records
 
 FIG_DIR = OUT_DIR / "figures"
 LAYOUT_DPI = 150
@@ -35,6 +56,7 @@ _models = None
 
 
 def get_models():
+    """레이아웃 모델 + 글자 상자 검출 전용 OCR. 프로세스마다 한 번만 만든다."""
     global _models
     if _models is None:
         from rapid_layout import RapidLayout
@@ -49,6 +71,7 @@ def get_models():
 
 
 def iou(a, b):
+    """두 영역이 겹치는 정도 (교집합 / 합집합). 중복 대상 거르기에 쓴다."""
     x0, y0 = max(a[0], b[0]), max(a[1], b[1])
     x1, y1 = min(a[2], b[2]), min(a[3], b[3])
     inter = max(0, x1 - x0) * max(0, y1 - y0)
@@ -71,12 +94,14 @@ def table_is_broken(t):
 
 
 def body_box(page):
+    """extract.py와 같은 여백을 뺀 본문 영역"""
     w, h = page.width, page.height
     return (page.bbox[0] + w * MARGIN["left"], page.bbox[1] + h * MARGIN["top"],
             page.bbox[2] - w * MARGIN["right"], page.bbox[3] - h * MARGIN["bottom"])
 
 
 def find_in_file(jsonl_file):
+    """jsonl 하나의 모든 페이지에서 Gemini 대상을 찾는다. (파일명, 대상 목록) 반환."""
     records = load_records(jsonl_file)
     first = records[0]
     domain, stem = first["domain"], jsonl_file.stem
@@ -95,17 +120,19 @@ def find_in_file(jsonl_file):
             image_blocks = [b for b in r["blocks"] if b["content_type"] == "image"]
             page_targets = []
 
-            # OCR 실패 영역은 블록 전체를 그대로 대상으로 (PNG는 OCR 단계에서 이미 저장됨)
+            # [1] OCR 실패 영역은 블록 전체를 그대로 대상으로 (PNG는 OCR 단계에서 이미 저장됨)
             for b in image_blocks:
                 if b.get("needs_vision") and b.get("image_path"):
                     page_targets.append({"kind": "ocr_failed", "bbox": b["bbox"],
                                          "image_path": b["image_path"], "block_id": b["block_id"]})
 
+            # [2] 본문 렌더링 -> 레이아웃 분석
             box = body_box(page)
             img = np.array(page.crop(box).to_image(resolution=LAYOUT_DPI).original.convert("RGB"))
             scale = 72 / LAYOUT_DPI
             lay = layout(img)
             for px, name, score in zip(lay.boxes or [], lay.class_names or [], lay.scores or []):
+                # [3] 영역 거르기
                 if name not in ("chart", "image", "table") or score < MIN_SCORE:
                     continue
                 pdf_box = [round(v, 1) for v in (box[0] + px[0] * scale, box[1] + px[1] * scale,
@@ -139,6 +166,7 @@ def find_in_file(jsonl_file):
                     continue
                 page_targets.append({"kind": kind, "bbox": pdf_box, "layout_score": round(float(score), 3)})
 
+            # [4] ID 부여·PNG 저장
             for i, t in enumerate(page_targets, start=1):
                 t["figure_id"] = f"page-{r['page_no']}-fig-{i}"
                 if "image_path" not in t:
@@ -155,6 +183,7 @@ def find_in_file(jsonl_file):
 
 
 def main():
+    """jsonl 파일 목록 -> 병렬로 대상 찾기 -> targets.jsonl 저장"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--only")
     parser.add_argument("--workers", type=int, default=4)

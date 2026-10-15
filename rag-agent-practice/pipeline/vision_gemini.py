@@ -7,11 +7,32 @@
 - 결과는 output/extracted/figures/results.jsonl에 하나씩 저장 (중간에 끊겨도 이어서 실행)
 - 반영: ocr_failed는 기존 이미지 블록의 text를 교체, 나머지는 페이지에 figure 블록으로 추가
 
+흐름
+    main()
+     ├─ .env 읽기 (GOOGLE_API_KEY, 모델 이름)
+     ├─ run(): 변환
+     │   [1] targets.jsonl(대상 목록) + results.jsonl(이미 끝난 결과) 읽기 -> 안 끝난 것만
+     │   [2] 스레드 여러 개로 convert() 동시 호출
+     │       convert(): PNG를 base64로 -> 종류별 프롬프트(PROMPTS)와 함께 Gemini 호출
+     │                  -> 마크다운 텍스트 + 토큰 사용량 (실패하면 쉬었다가 최대 4번 재시도)
+     │   [3] 끝나는 대로 results.jsonl에 한 줄씩 저장 (끊겨도 다시 실행하면 이어짐)
+     └─ merge(): 결과를 추출 JSONL에 반영
+         [1] 파일마다 기존 figure 블록을 지우고 (여러 번 실행해도 결과가 같게)
+         [2] ocr_failed -> 해당 이미지 블록 text 교체, needs_vision=False
+             chart/diagram/table -> figure 블록을 읽기 순서 위치에 삽입
+         [3] JSONL 다시 쓰기 -> 미리보기·INDEX 갱신
+
 실행
-    python vision_gemini.py                 # 전체
-    python vision_gemini.py --limit 5       # 앞에서 5개만 (품질 확인용)
-    python vision_gemini.py --merge-only    # 저장된 결과로 JSONL·미리보기만 다시 반영
+    python -m pipeline.vision_gemini                 # 전체
+    python -m pipeline.vision_gemini --limit 5       # 앞에서 5개만 (품질 확인용)
+    python -m pipeline.vision_gemini --merge-only    # 저장된 결과로 JSONL·미리보기만 다시 반영
 """
+
+import sys
+from pathlib import Path
+
+# pipeline 폴더 안에서 python 파일명.py 로 바로 실행해도 pipeline 패키지를 찾게 한다
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import base64
@@ -23,8 +44,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
-from extract import BASE_DIR, JSONL_DIR, OUT_DIR, load_records, write_index, write_preview
-from find_figures import FIG_DIR
+from pipeline.extract import BASE_DIR, JSONL_DIR, OUT_DIR, load_records, write_index, write_preview
+from pipeline.find_figures import FIG_DIR
 
 TARGETS = FIG_DIR / "targets.jsonl"
 RESULTS = FIG_DIR / "results.jsonl"
@@ -71,10 +92,12 @@ _lock = threading.Lock()
 
 
 def target_key(t):
+    """대상 고유 키 = jsonl 경로 # figure_id (결과 저장·이어서 실행에 쓴다)"""
     return f"{t['jsonl']}#{t['figure_id']}"
 
 
 def load_done():
+    """results.jsonl에 저장된 결과를 {키: 결과}로 읽는다."""
     done = {}
     if RESULTS.exists():
         for line in RESULTS.open(encoding="utf-8"):
@@ -87,11 +110,13 @@ def load_done():
 
 
 def make_llm(model):
+    """Gemini 채팅 모델 (temperature=0)"""
     from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(model=model, timeout=120, max_retries=2, temperature=0)
 
 
 def convert(llm, t):
+    """대상 하나: PNG + 종류별 프롬프트 -> Gemini -> (마크다운, 토큰 사용량)"""
     from langchain_core.messages import HumanMessage
     png = (OUT_DIR / t["image_path"]).read_bytes()
     message = HumanMessage(content=[
@@ -114,6 +139,8 @@ def convert(llm, t):
 
 
 def run(model, workers, limit):
+    """안 끝난 대상을 동시에 변환해 results.jsonl에 쌓는다."""
+    # [1] 대상·완료 목록 읽기
     targets = [json.loads(l) for l in TARGETS.open(encoding="utf-8")]
     done = load_done()
     todo = [t for t in targets if target_key(t) not in done]
@@ -122,6 +149,7 @@ def run(model, workers, limit):
     print(f"대상 {len(targets)}개 / 완료 {len(done)}개 / 이번 실행 {len(todo)}개 (모델: {model})", flush=True)
     if not todo:
         return
+    # [2] 동시 호출 / [3] 끝나는 대로 저장
     llm = make_llm(model)
     n_ok = n_err = 0
     with ThreadPoolExecutor(max_workers=workers) as pool, RESULTS.open("a", encoding="utf-8") as out:
@@ -156,8 +184,10 @@ def merge():
         path = JSONL_DIR / jsonl_rel
         records = load_records(path)
         pages = {r["page_no"]: r for r in records}
+        # [1] 기존 figure 블록 지우기
         for r in records:
             r["blocks"] = [b for b in r["blocks"] if b["content_type"] != "figure"]
+        # [2] 결과 반영
         for t in items:
             res = done[target_key(t)]
             r = pages[t["page_no"]]
@@ -176,6 +206,7 @@ def merge():
             # 읽기 순서: 그림 위쪽 좌표보다 위에서 시작한 블록들 뒤에 넣는다
             pos = sum(1 for b in r["blocks"] if b["bbox"][1] <= t["bbox"][1])
             r["blocks"].insert(pos, block)
+        # [3] 다시 쓰기
         tmp = path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             for r in records:
@@ -188,6 +219,7 @@ def merge():
 
 
 def main():
+    """변환(run) -> 반영(merge). --merge-only면 반영만."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--workers", type=int, default=6)

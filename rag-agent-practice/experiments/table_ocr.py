@@ -9,6 +9,14 @@
   3. 표 구조 모델(SLANet+)로 행·열·병합 셀 인식 -> OCR 글자를 셀에 배치 -> HTML
   4. HTML -> 마크다운 표 (병합 셀은 값을 반복해서 채움)
 
+흐름
+    main()
+     [1] 파일명 일부로 jsonl 하나 찾기 -> 레이아웃·표 모델과 OCR 엔진 준비
+     [2] 이미 OCR한 이미지 블록마다 저장된 PNG 열기 -> 레이아웃 모델로 table 영역 찾기
+     [3] 표 영역마다: 잘라서 OCR -> 표 구조 모델로 HTML -> html_to_rows() -> rows_to_markdown()
+     [4] 원본 표 이미지 PNG + 인식 결과 표 + 기존 줄 단위 OCR 결과를 md에 나란히 기록
+     (이 실험 결과를 보고 표 인식을 pipeline/ocr_images.py에 넣었다)
+
 실행
     python experiments/table_ocr.py 한-호주
 """
@@ -24,8 +32,8 @@ from PIL import Image
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
-from extract import JSONL_DIR, OUT_DIR, load_records, markdown_row  # noqa: E402
-from ocr_images import get_engine  # noqa: E402
+from pipeline.extract import JSONL_DIR, OUT_DIR, load_records, markdown_row  # noqa: E402
+from pipeline.ocr_images import get_engine  # noqa: E402
 
 EXP_DIR = BASE_DIR / "output" / "experiments" / "table_ocr"
 MIN_TABLE_SCORE = 0.5
@@ -34,6 +42,7 @@ logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 
 
 def load_models():
+    """레이아웃 모델(PP-DocLayoutV3) + 표 구조 모델(SLANet+)"""
     from rapid_layout import RapidLayout
     from rapid_layout.utils.typings import ModelType as LayoutModel, RapidLayoutInput
     from rapid_table import RapidTable
@@ -67,6 +76,7 @@ def html_to_rows(html):
 
 
 def rows_to_markdown(rows):
+    """첫 행을 헤더로 쓰는 마크다운 표"""
     lines = [markdown_row(rows[0]), markdown_row(["---"] * len(rows[0]))]
     lines += [markdown_row(r) for r in rows[1:]]
     return "\n".join(lines)

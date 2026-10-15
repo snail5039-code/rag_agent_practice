@@ -4,13 +4,34 @@
 - 여백 제거: 페이지 가장자리(MARGIN 비율)를 잘라내고 안쪽만 읽는다 (머리말·꼬리말·쪽번호 제거)
 - 표: find_tables() -> 마크다운 표 + 바로 아래 각주
 - 가짜 표: 1행 또는 1열(1행 1열 포함)은 표로 취급하지 않고 일반 텍스트로 읽는다
+- 깨진 표: 표로 읽은 셀 글자가 표 영역 실제 글자의 70% 미만이면 일반 텍스트로 읽는다
 - 이미지: 페이지 면적 10% 초과만 후보로 기록 (Gemini/OCR 변환은 다음 단계)
 - 페이지 유형: text(텍스트형) / mixed(혼합형) / scan(이미지형, 글자 없음) / empty(글자·이미지 없음)
 
+흐름
+    main()
+     ├─ data/**/*.pdf 목록 -> 파일마다 병렬로 extract_pdf()
+     │   └─ extract_pdf(): 이미 저장한 페이지는 건너뛰고, 페이지마다 extract_page() -> JSONL 한 줄씩 저장
+     │       └─ extract_page(): 한 페이지 처리
+     │           [1] 여백 잘라내기(within_bbox) + 중복 글자 제거 + (cid) 깨진 글자 제거
+     │           [2] 표: find_tables() -> clean_rows() -> is_real_table()로 1행/1열 거르기
+     │                   -> 셀 글자가 많이 빠진 표도 거르기(텍스트로 읽음)
+     │                   -> table_to_markdown() + find_footnotes()로 각주 붙이기
+     │           [3] 본문: 표 영역 밖 글자만 -> detect_columns()로 2단 감지 -> read_lines()로 줄 읽기
+     │           [4] 이미지: 면적 10% 넘는 이미지를 OCR 대상(needs_vision)으로 기록
+     │           [5] reading_key()로 읽기 순서 정렬, 이어진 텍스트 줄은 한 블록으로 합치기
+     │           [6] 글자가 없거나 깨진 페이지는 페이지 전체를 이미지 대상으로 추가
+     │           [7] 페이지 유형(text/mixed/scan/empty) 판정 -> dict 반환
+     └─ write_preview()로 파일별 미리보기 md, write_index()로 INDEX.md 생성
+
+    다른 단계에서 가져다 쓰는 것: load_records, write_preview, write_index, markdown_row,
+    inside, is_real_table, layout_from_words, reading_key, MARGIN, 경로 상수들
+
 실행
-    python extract.py                 # data/ 아래 모든 PDF 추출 (이어서 실행 가능)
-    python extract.py --only 앙골라    # 파일명에 포함된 것만
-    python extract.py --preview-only  # JSONL로 미리보기만 다시 생성
+    python -m pipeline.extract                 # data/ 아래 모든 PDF 추출 (이어서 실행 가능)
+    python -m pipeline.extract --only 앙골라    # 파일명에 포함된 것만
+    python -m pipeline.extract --preview-only  # JSONL로 미리보기만 다시 생성
+    python -m pipeline.extract --refresh-tables  # 표 있는 페이지만 다시 추출 (깨진 표 -> 텍스트, OCR·Gemini 유지)
 """
 
 import argparse
@@ -22,7 +43,7 @@ from pathlib import Path
 
 import pdfplumber
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent.parent  # rag-agent-practice/
 DATA_DIR = BASE_DIR / "data"
 OUT_DIR = BASE_DIR / "output" / "extracted"
 JSONL_DIR = OUT_DIR / "jsonl"
@@ -34,16 +55,19 @@ MARGIN = {"top": 0.06, "bottom": 0.07, "left": 0.03, "right": 0.03}
 MIN_IMAGE_AREA_RATIO = 0.10
 FOOTNOTE_PREFIXES = ("*", "※", "주:", "주)", "자료:", "출처:", "(주)", "* ")
 FOOTNOTE_GAP = 25  # 표 하단에서 이 거리(pt) 안에서 시작하는 각주만 표에 붙인다
+MIN_TABLE_TEXT_RATIO = 0.7  # 표로 읽은 글자가 표 영역 실제 글자의 70% 미만이면 깨진 표로 보고 텍스트로 읽는다
 
 # pdfminer의 폰트 경고(Cannot set gray ...)가 너무 많아서 끈다
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 
 def normalize_cell(value):
+    """셀 값의 줄바꿈·연속 공백을 한 칸으로 정리한다 (None은 빈 문자열)."""
     return " ".join((value or "").split())
 
 
 def markdown_row(values):
+    """셀 목록 -> 마크다운 표 한 줄. 셀 안의 | 는 이스케이프한다."""
     return "| " + " | ".join(v.replace("|", r"\|") for v in values) + " |"
 
 
@@ -65,6 +89,7 @@ def is_real_table(rows):
 
 
 def table_to_markdown(rows):
+    """첫 행을 헤더로 쓰는 마크다운 표를 만든다. (헤더, 데이터 행, 마크다운 문자열) 반환."""
     headers = rows[0]
     body = []
     current_first = ""
@@ -98,12 +123,14 @@ def find_footnotes(lines, table_bbox):
 
 
 def inside(obj, bbox):
+    """글자(또는 박스)의 중심점이 bbox 안에 있는지. 표·단 영역에 글자를 나눌 때 쓴다."""
     cx = (obj["x0"] + obj["x1"]) / 2
     cy = (obj["top"] + obj["bottom"]) / 2
     return bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]
 
 
 def detect_columns(page):
+    """페이지 단어로 2단 편집인지 판단한다 (layout_from_words 참고)."""
     return layout_from_words(page.extract_words(), page.bbox)
 
 
@@ -150,6 +177,7 @@ def layout_from_words(words, bbox, min_words=40):
 
 
 def reading_key(bbox, layout):
+    """블록 정렬 키. 1단은 (위->아래, 왼->오), 2단은 (구간, 왼쪽 단 먼저, 위->아래)."""
     x0, top, x1, bottom = bbox
     if not layout:
         return (0, 0, round(top), x0)
@@ -191,6 +219,8 @@ def read_lines(page, layout):
 
 
 def extract_page(page, page_no):
+    """한 페이지 -> {페이지 정보, blocks: [text/table/image 블록]} (흐름은 파일 맨 위 [1]~[7])"""
+    # [1] 여백 잘라내기
     w, h = page.width, page.height
     crop_box = (
         page.bbox[0] + w * MARGIN["left"],
@@ -207,9 +237,10 @@ def extract_page(page, page_no):
     broken_font = n_chars > 0 and n_cid / n_chars > 0.3
     all_lines = body.extract_text_lines(return_chars=False)
 
-    # ---- 표 ----
+    # [2] 표 ----
     regions = []
     fake_tables = 0
+    broken_tables = 0
     for t_idx, table in enumerate(body.find_tables(), start=1):
         rows = clean_rows(table.extract())
         if not rows:
@@ -217,6 +248,13 @@ def extract_page(page, page_no):
         if not is_real_table(rows):
             # 1행/1열 -> 표 영역으로 잡지 않으므로 글자가 본문 텍스트로 그대로 읽힌다
             fake_tables += 1
+            continue
+        # 셀 글자가 많이 빠진 표(칸 안 긴 글을 빈칸으로 읽는 경우) -> 표 영역 글자는 본문에서 빠지므로
+        # 그대로 쓰면 내용이 통째로 사라진다. 표로 쓰지 않고 본문 텍스트로 읽는다
+        got = sum(len(c.replace(" ", "")) for r in rows for c in r)
+        real = sum(1 for c in body.chars if inside(c, table.bbox) and c["text"].strip())
+        if real and got / real < MIN_TABLE_TEXT_RATIO:
+            broken_tables += 1
             continue
         headers, body_rows, table_md = table_to_markdown(rows)
         footnote_lines = find_footnotes(all_lines, table.bbox)
@@ -236,7 +274,7 @@ def extract_page(page, page_no):
             "footnotes": footnotes,
         })
 
-    # ---- 본문 텍스트 (표 영역 밖의 글자만) ----
+    # [3] 본문 텍스트 (표 영역 밖의 글자만) ----
     table_boxes = [r["bbox"] for r in regions]
     text_page = body.filter(
         lambda o: o.get("object_type") != "char" or not any(inside(o, b) for b in table_boxes)
@@ -247,7 +285,7 @@ def extract_page(page, page_no):
         for l in read_lines(text_page, layout)
     ]
 
-    # ---- 이미지 후보 (면적 10% 초과) ----
+    # [4] 이미지 후보 (면적 10% 초과) ----
     page_area = w * h
     images = []
     # 페이지 전체를 덮는 스캔 이미지는 여백까지 걸쳐 있어 body에서 빠지므로 원본 페이지에서 찾고 여백 안쪽으로 자른다
@@ -267,7 +305,7 @@ def extract_page(page, page_no):
                 "needs_vision": True,
             })
 
-    # ---- 읽기 순서로 정렬하고 연속된 텍스트 줄은 합친다 ----
+    # [5] 읽기 순서로 정렬하고 연속된 텍스트 줄은 합친다 ----
     # 1단: 위->아래, 왼->오 / 2단: 구간마다 왼쪽 단을 다 읽고 오른쪽 단
     positioned += [dict(r) for r in regions] + images
     positioned.sort(key=lambda b: reading_key(b["bbox"], layout))
@@ -286,6 +324,7 @@ def extract_page(page, page_no):
         b["block_id"] = f"page-{page_no}-block-{idx}"
         b["bbox"] = [round(v, 1) for v in b["bbox"]]
 
+    # [6] 페이지 전체를 이미지 대상으로 추가할지 판단 ----
     char_count = len(text_page.chars) + sum(len(r["text"]) for r in regions)
     # 글자가 없는데 큰 이미지도 없는 페이지 -> 페이지 전체를 이미지 처리 대상으로 표시
     # - 글자를 벡터 곡선으로 그린 경우(아웃라인 폰트)
@@ -310,6 +349,7 @@ def extract_page(page, page_no):
             "block_id": f"page-{page_no}-block-{len(blocks)}",
         })
         images.append(blocks[-1])
+    # [7] 페이지 유형 판정 ----
     if char_count < 20:
         page_type = "scan" if images else "empty"
     elif images:
@@ -324,6 +364,7 @@ def extract_page(page, page_no):
         "char_count": char_count,
         "n_tables": len(regions),
         "n_fake_tables": fake_tables,
+        "n_broken_tables": broken_tables,
         "n_images": len(images),
         "n_cid_removed": n_cid,
         "blocks": blocks,
@@ -331,12 +372,14 @@ def extract_page(page, page_no):
 
 
 def jsonl_path_for(pdf_path):
+    """data/<분야>/<파일>.pdf -> output/extracted/jsonl/<분야>/<파일>.jsonl"""
     # 판례 파일명이 너무 길어 Windows 경로 제한(260자)에 걸리므로 80자로 자른다 (원래 이름은 file_name에 보관)
     rel = pdf_path.relative_to(DATA_DIR)
     return JSONL_DIR / rel.parent / f"{pdf_path.stem[:80]}.jsonl"
 
 
 def extract_pdf(pdf_path):
+    """PDF 하나를 페이지별로 추출해 JSONL에 이어 쓴다. (전체 쪽수, 새로 추출한 쪽수) 반환."""
     out_path = jsonl_path_for(pdf_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -375,13 +418,49 @@ def extract_pdf(pdf_path):
     return total, new
 
 
+def refresh_table_pages(jsonl_file):
+    """표가 있는 페이지만 다시 추출해서, 깨진 표가 있으면 텍스트·표 블록을 새 결과로 바꾼다.
+
+    이미지 블록(OCR·Gemini 결과)과 figure 블록(Gemini 그림)은 이전 것을 그대로 붙인다.
+    표 검증 규칙을 추가한 뒤 전체를 다시 돌리지 않고 해당 페이지만 고치기 위한 함수.
+    """
+    records = load_records(jsonl_file)
+    first = records[0]
+    changed = []
+    with pdfplumber.open(DATA_DIR / first["domain"] / first["file_name"]) as pdf:
+        for i, r in enumerate(records):
+            if not r.get("n_tables"):
+                continue
+            new = extract_page(pdf.pages[r["page_no"] - 1], r["page_no"])
+            if not new["n_broken_tables"]:
+                continue
+            # 이미지 블록은 image_id로 이전 결과(OCR·Gemini)를 그대로 쓰고, figure 블록은 위치에 맞게 다시 끼운다
+            old_images = {b["image_id"]: b for b in r["blocks"] if b["content_type"] == "image"}
+            blocks = [old_images.get(b.get("image_id"), b) if b["content_type"] == "image" else b
+                      for b in new["blocks"]]
+            for fig in (b for b in r["blocks"] if b["content_type"] == "figure"):
+                pos = sum(1 for b in blocks if b["bbox"][1] <= fig["bbox"][1])
+                blocks.insert(pos, fig)
+            records[i] = {**r, **{k: v for k, v in new.items() if k != "blocks"}, "blocks": blocks}
+            changed.append(r["page_no"])
+    if changed:
+        tmp = jsonl_file.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp, jsonl_file)
+    return first["file_name"], changed
+
+
 def load_records(jsonl_file):
+    """JSONL -> 페이지 dict 목록 (쪽 번호 순). 다른 단계 모두 이 함수로 추출 결과를 읽는다."""
     with jsonl_file.open(encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
     return sorted(records, key=lambda r: r["page_no"])
 
 
 def write_preview(jsonl_file):
+    """JSONL 하나 -> 사람이 보는 미리보기 md (텍스트, 표, 이미지+OCR/Gemini 결과, 그림)"""
     records = load_records(jsonl_file)
     if not records:
         return None
@@ -446,6 +525,7 @@ def write_preview(jsonl_file):
 
 
 def write_index(summaries):
+    """파일별 통계 표와 미리보기 링크를 모은 INDEX.md를 만든다."""
     lines = [
         "# PDF 추출 결과",
         "",
@@ -467,9 +547,12 @@ def write_index(summaries):
 
 
 def main():
+    """PDF 목록 -> 병렬 추출 -> 미리보기·INDEX 생성"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", help="파일명에 이 문자열이 들어간 PDF만 처리")
     parser.add_argument("--preview-only", action="store_true")
+    parser.add_argument("--refresh-tables", action="store_true",
+                        help="표가 있는 페이지만 다시 추출해 깨진 표를 텍스트로 바꾼다 (OCR·Gemini 결과 유지)")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     args = parser.parse_args()
 
@@ -478,7 +561,14 @@ def main():
     if args.only:
         pdfs = [p for p in pdfs if args.only in p.name]
 
-    if not args.preview_only:
+    if args.refresh_tables:
+        for f in sorted(JSONL_DIR.rglob("*.jsonl")):
+            if args.only and args.only not in f.name:
+                continue
+            name, changed = refresh_table_pages(f)
+            if changed:
+                print(f"{name}: 깨진 표가 있던 {len(changed)}쪽 다시 추출 {changed}", flush=True)
+    elif not args.preview_only:
         # 파일 단위로 병렬 처리 (파일마다 JSONL이 따로라 서로 겹치지 않는다)
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = {pool.submit(extract_pdf, p): p for p in pdfs}
