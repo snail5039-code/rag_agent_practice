@@ -411,6 +411,13 @@ def write_preview(jsonl_file):
                 lines += [b["text"], ""]
             elif b["content_type"] == "table":
                 lines += [f"**[표 {b['table_id']}]**", "", b["text"], ""]
+            elif b["content_type"] == "figure":
+                kind = {"chart": "차트", "diagram": "다이어그램", "table": "표(이미지)"}[b["figure_kind"]]
+                lines += [
+                    f"> 🧩 [{kind} {b['figure_id']}] — Gemini 변환 ({b['vision_method']})", "",
+                    f"![{b['figure_id']}](<../../{b['image_path']}>)", "",
+                    b["text"], "",
+                ]
             else:
                 kind = {
                     "vector_text": "글자가 벡터로 그려진 페이지 전체",
@@ -421,7 +428,8 @@ def write_preview(jsonl_file):
                     lines += [f"> 🖼 [이미지 {b['image_id']}] {kind} — Gemini/OCR 변환 대기", ""]
                     continue
                 st = b["ocr_stats"]
-                status = "Gemini 필요" if b.get("needs_vision") else "OCR 완료"
+                status = ("Gemini 변환 완료" if b.get("vision_method")
+                          else "Gemini 필요" if b.get("needs_vision") else "OCR 완료")
                 lines += [
                     f"> 🖼 [이미지 {b['image_id']}] {kind} — {status} "
                     f"(표 {st.get('tables', 0)}개 / 글상자 {st['kept']}개 사용 / "
@@ -431,7 +439,8 @@ def write_preview(jsonl_file):
                     "",
                 ]
                 if b["text"]:
-                    lines += ["**[OCR]**", "", b["text"], ""]
+                    label = "[Gemini]" if b.get("vision_method") else "[OCR]"
+                    lines += [f"**{label}**", "", b["text"], ""]
     out.write_text("\n".join(lines), encoding="utf-8")
     return out, records
 
