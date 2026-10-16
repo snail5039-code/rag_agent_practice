@@ -15,7 +15,7 @@
     Retriever(config)
      [1] chunks.jsonl 읽기 -> chunk_id로 본문·메타데이터를 찾을 수 있게 사전으로
      [2] Chroma 컬렉션 열기(embed.get_store) -> similarity, mmr
-     [3] BM25Search로 전체 청크 색인 (Kiwi 형태소)
+     [3] BM25Search로 전체 청크 색인 (Kiwi 형태소, vectordb/bm25_<설정>.pkl에 저장해 두고 재사용)
     Retriever.search(query, is_table, domain, k)
      -> is_table이면 mmr(), 아니면 hybrid() -> 청크 dict 목록 (chunk_id, 파일명, 쪽, 본문 ...)
 
@@ -31,31 +31,45 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
+import hashlib
 import json
+import pickle
 import time
 from collections import defaultdict
 
 from rank_bm25 import BM25Okapi
 
 from pipeline.chunk import CHUNK_DIR
-from pipeline.embed import get_store
+from pipeline.embed import VECTORDB_DIR, get_store
 
 RRF_C = 60  # RRF 상수 (순위 1등 = 1/61)
 DOMAINS = ("finance", "public", "commerce", "law", "medical")
 
 
 class BM25Search:
-    """Kiwi로 형태소를 나눠 BM25로 검색한다. 조사·어미는 빼고 의미 있는 품사만 쓴다."""
+    """Kiwi로 형태소를 나눠 BM25로 검색한다. 조사·어미는 빼고 의미 있는 품사만 쓴다.
+
+    청크를 형태소로 나누는 데 20초쯤 걸려서, cache_path를 주면 나눈 결과를 파일로 저장해 두고
+    다음부터는 읽어 온다. 청크 본문이 하나라도 바뀌면(fingerprint가 다르면) 다시 만든다.
+    """
     KEEP = ("NN", "NR", "NP", "VV", "VA", "XR", "SL", "SN", "SH", "MAG")
 
-    def __init__(self, chunks):
+    def __init__(self, chunks, cache_path=None):
         from kiwipiepy import Kiwi
         self.kiwi = Kiwi()
         self.chunks = chunks
         t0 = time.time()
-        corpus = [self.tokenize(c["text"]) for c in chunks]
+        fingerprint = hashlib.sha1("".join(c["chunk_id"] + c["text"] for c in chunks).encode()).hexdigest()
+        cache = pickle.loads(cache_path.read_bytes()) if cache_path and cache_path.exists() else {}
+        if cache.get("fingerprint") == fingerprint:
+            corpus, how = cache["corpus"], "저장된 색인 사용"
+        else:
+            corpus, how = [self.tokenize(c["text"]) for c in chunks], "새로 만듦"
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_bytes(pickle.dumps({"fingerprint": fingerprint, "corpus": corpus}))
         self.bm25 = BM25Okapi(corpus)
-        print(f"  BM25 색인: 청크 {len(chunks)}개 ({time.time() - t0:.0f}초)")
+        print(f"  BM25 색인: 청크 {len(chunks)}개, {how} ({time.time() - t0:.1f}초)")
 
     def tokenize(self, text):
         return [t.form.lower() for t in self.kiwi.tokenize(text) if t.tag.startswith(self.KEEP)]
@@ -96,7 +110,7 @@ class Retriever:
         self.by_id = {r["chunk_id"]: r for r in self.rows}
         # [2] 벡터DB / [3] BM25 색인
         self.store = get_store(config)
-        self.bm25_index = BM25Search(self.rows)
+        self.bm25_index = BM25Search(self.rows, cache_path=VECTORDB_DIR / f"bm25_{config}.pkl")
 
     def _docs(self, docs):
         # Chroma 결과(Document) -> chunks.jsonl의 청크 dict
