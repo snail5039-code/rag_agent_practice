@@ -17,8 +17,14 @@ aim-ai-agent-my 30번 노트북(langgraph-evaluation)과 같은 구조:
     python -m pipeline.evaluate_agent                      # 전체 (이미 푼 문제는 건너뛰고 이어서)
     python -m pipeline.evaluate_agent --ids my-03,gs-010   # 특정 문제만
     python -m pipeline.evaluate_agent --fresh              # 처음부터 다시
+    python -m pipeline.evaluate_agent --model gemini-3.6-flash   # 문제 푸는 모델 바꾸기 (채점 모델은 그대로)
 
-결과: output/eval/agent/<골든셋>__<청킹설정>/details.jsonl (문제별), report.md (요약·실패 사례)
+모델
+- 문제 푸는 모델: --model (기본은 agent.py의 DEFAULT_MODEL)
+- 채점 모델: JUDGE_MODEL로 고정. 실험끼리 공정하게 비교하려면 채점 기준이 같아야 하기 때문
+  (3.6-flash·3.5-flash-lite·2.5-flash·2.5-flash-lite 모두 맞은 답 8개·틀린 답 4개를 12/12로 판정 -> 가장 빠른 것)
+
+결과: output/eval/agent/<골든셋>__<청킹설정>__<모델>/details.jsonl (문제별), report.md (요약·실패 사례)
 
 흐름
     main()
@@ -37,15 +43,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import json
 
+from pipeline.agent import DEFAULT_MODEL, RagAgent
 from pipeline.evaluate_retrievers import load_golden, norm_name
 from pipeline.extract import BASE_DIR
 
 EVAL_DIR = BASE_DIR / "output" / "eval" / "agent"
+JUDGE_MODEL = "gemini-3.5-flash-lite"
 
 
 # ---------------- 채점 함수 ----------------
 
-def make_answer_judge(model_name):
+def make_answer_judge():
     """30번 노트북과 같은 LLM 채점기: CORRECTNESS_PROMPT + Gemini -> {score: True/False, comment}"""
     from langchain_google_genai import ChatGoogleGenerativeAI
     from openevals.llm import create_llm_as_judge
@@ -53,7 +61,7 @@ def make_answer_judge(model_name):
 
     return create_llm_as_judge(
         prompt=CORRECTNESS_PROMPT,
-        judge=ChatGoogleGenerativeAI(model=model_name, timeout=120, max_retries=6),
+        judge=ChatGoogleGenerativeAI(model=JUDGE_MODEL, timeout=120, max_retries=6),
         feedback_key="answer_correct",
     )
 
@@ -156,6 +164,7 @@ def main():
     parser.add_argument("--limit", type=int, help="앞에서부터 N문제만")
     parser.add_argument("--ids", help="풀 문제 id (쉼표로 구분)")
     parser.add_argument("--fresh", action="store_true", help="이전 결과를 지우고 처음부터")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="문제 푸는 모델 (채점 모델은 JUDGE_MODEL로 고정)")
     args = parser.parse_args()
 
     # [1] 골든셋
@@ -166,7 +175,7 @@ def main():
     if args.limit:
         golden = golden[:args.limit]
 
-    out_dir = EVAL_DIR / f"{golden_path.stem}__{args.config}"
+    out_dir = EVAL_DIR / f"{golden_path.stem}__{args.config}__{args.model}"
     out_dir.mkdir(parents=True, exist_ok=True)
     details = out_dir / "details.jsonl"
     if args.fresh:
@@ -179,9 +188,8 @@ def main():
 
     # [3] 풀고 채점 -> 한 줄씩 바로 저장 (중간에 끊겨도 다시 실행하면 이어서)
     if todo:
-        from pipeline.agent import RagAgent
-        agent = RagAgent(config=args.config)
-        judge = make_answer_judge(agent.model_name)
+        agent = RagAgent(config=args.config, model=args.model)
+        judge = make_answer_judge()
         for i, q in enumerate(todo, start=1):
             row = {k: q[k] for k in ("qid", "domain", "context_type", "source", "question",
                                      "target_answer", "answerable")}
@@ -207,7 +215,8 @@ def main():
     if not rows:
         print("채점된 문제가 없습니다.")
         return
-    write_report(rows, out_dir / "report.md", f"에이전트 평가 - {golden_path.name} / {args.config}")
+    write_report(rows, out_dir / "report.md",
+                 f"에이전트 평가 - {golden_path.name} / {args.config} / 푼 모델 {args.model} / 채점 {JUDGE_MODEL}")
     print("\n" + md_table([summarize("전체", rows)]))
     print(f"오류로 빠진 문제 {len(golden) - len(rows)}개 (다시 실행하면 이어서 풂)")
     print(f"보고서: {out_dir / 'report.md'}")

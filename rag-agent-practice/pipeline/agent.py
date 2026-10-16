@@ -54,7 +54,8 @@ warnings.filterwarnings("ignore", message=r"Model .* uses fixed sampling default
 logging.getLogger("google_genai").setLevel(logging.ERROR)
 
 RUNS_DIR = BASE_DIR / "output" / "runs"
-DEFAULT_MODEL = "gemini-3.6-flash"
+# 3.6-flash·2.5-flash·2.5-flash-lite와 비교해 가장 빠르고(질문당 약 4초) 재검색·보류도 제대로 해서 선택
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 MAX_SEARCHES = 3
 
 SYSTEM_PROMPT = f"""너는 한국어 PDF 문서(금융·공공·커머스·법률·의료)에 근거해서만 답하는 RAG 에이전트다.

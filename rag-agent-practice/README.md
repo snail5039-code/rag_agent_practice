@@ -69,7 +69,8 @@ python -m pipeline.evaluate_agent --limit 5                              # 9. �
 python -m pipeline.evaluate_agent                                        #    전체 (끊겨도 다시 실행하면 이어서)
 ```
 
-에이전트 평가 결과는 `output/eval/agent/<골든셋>__<청킹설정>/report.md`에 저장된다.
+에이전트 평가 결과는 `output/eval/agent/<골든셋>__<청킹설정>__<모델>/report.md`에 저장된다.
+모델: 에이전트 기본 `gemini-3.5-flash-lite` (`--model`로 변경), 채점은 `gemini-3.5-flash-lite`로 고정.
 채점: 답변 정확도(openevals CORRECTNESS, LLM 채점), 근거 쪽 적중, 검색 적중, 보류 판단, 검색 횟수, 응답 시간.
 
 검색만 확인:
