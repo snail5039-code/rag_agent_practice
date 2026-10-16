@@ -48,11 +48,10 @@ import json
 import re
 import statistics
 from collections import Counter
-from pathlib import Path
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from pipeline.extract import BASE_DIR, JSONL_DIR, load_records, markdown_row
+from pipeline.extract import BASE_DIR, jsonl_files, load_records, markdown_row, markdown_table
 
 CHUNK_DIR = BASE_DIR / "output" / "chunks"
 
@@ -166,8 +165,7 @@ def split_table_rows(header_lines, row_lines, suffix, size):
 
 def split_pdf_table(block, size):
     """extract.py가 저장한 표 블록(headers, rows, footnotes) -> 행 단위 청크"""
-    headers = block["headers"]
-    header_lines = [markdown_row(headers), markdown_row(["---"] * len(headers))]
+    header_lines = markdown_table(block["headers"], []).split("\n")
     rows = [markdown_row(r) for r in block["rows"]]
     return split_table_rows(header_lines, rows, block.get("footnotes", ""), size)
 
@@ -290,7 +288,7 @@ def build(size, overlap, with_header):
     (out_dir / "preview").mkdir(parents=True, exist_ok=True)
     all_chunks = []
 
-    for jsonl in sorted(JSONL_DIR.rglob("*.jsonl")):
+    for jsonl in jsonl_files():
         records = load_records(jsonl)
         first = records[0]
         # [1] 문서 유형 / [2] 러닝 타이틀

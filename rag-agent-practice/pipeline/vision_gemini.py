@@ -14,7 +14,7 @@
      │   [1] targets.jsonl(대상 목록) + results.jsonl(이미 끝난 결과) 읽기 -> 안 끝난 것만
      │   [2] 스레드 여러 개로 convert() 동시 호출
      │       convert(): PNG를 base64로 -> 종류별 프롬프트(PROMPTS)와 함께 Gemini 호출
-     │                  -> 마크다운 텍스트 + 토큰 사용량 (실패하면 쉬었다가 최대 4번 재시도)
+     │                  -> 마크다운 텍스트 + 토큰 사용량 (속도 제한 등 실패는 LLM이 알아서 재시도)
      │   [3] 끝나는 대로 results.jsonl에 한 줄씩 저장 (끊겨도 다시 실행하면 이어짐)
      └─ merge(): 결과를 추출 JSONL에 반영
          [1] 파일마다 기존 figure 블록을 지우고 (여러 번 실행해도 결과가 같게)
@@ -38,13 +38,11 @@ import argparse
 import base64
 import json
 import os
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
-from pipeline.extract import BASE_DIR, JSONL_DIR, OUT_DIR, load_records, write_index, write_preview
+from pipeline.extract import BASE_DIR, JSONL_DIR, OUT_DIR, load_records, refresh_previews, save_records
 from pipeline.find_figures import FIG_DIR
 
 TARGETS = FIG_DIR / "targets.jsonl"
@@ -88,8 +86,6 @@ PROMPTS = {
 """,
 }
 
-_lock = threading.Lock()
-
 
 def target_key(t):
     """대상 고유 키 = jsonl 경로 # figure_id (결과 저장·이어서 실행에 쓴다)"""
@@ -110,9 +106,9 @@ def load_done():
 
 
 def make_llm(model):
-    """Gemini 채팅 모델 (temperature=0)"""
+    """Gemini 채팅 모델. 속도 제한(429) 등은 max_retries만큼 알아서 기다렸다 재시도한다."""
     from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(model=model, timeout=120, max_retries=2, temperature=0)
+    return ChatGoogleGenerativeAI(model=model, timeout=120, max_retries=6)
 
 
 def convert(llm, t):
@@ -123,19 +119,10 @@ def convert(llm, t):
         {"type": "text", "text": PROMPTS[t["kind"]]},
         {"type": "image", "base64": base64.b64encode(png).decode("ascii"), "mime_type": "image/png"},
     ])
-    for attempt in range(4):
-        try:
-            resp = llm.invoke([message])
-            text = resp.text if isinstance(resp.text, str) else resp.text()
-            usage = getattr(resp, "usage_metadata", None) or {}
-            return text.strip(), {"input_tokens": usage.get("input_tokens"),
-                                  "output_tokens": usage.get("output_tokens")}
-        except Exception as e:  # 속도 제한 등 -> 잠깐 쉬고 재시도
-            if attempt == 3:
-                raise
-            time.sleep(5 * (attempt + 1))
-            last = e
-    raise last
+    resp = llm.invoke([message])
+    usage = resp.usage_metadata or {}
+    return resp.text.strip(), {"input_tokens": usage.get("input_tokens"),
+                               "output_tokens": usage.get("output_tokens")}
 
 
 def run(model, workers, limit):
@@ -158,10 +145,10 @@ def run(model, workers, limit):
             t = futures[fut]
             try:
                 text, usage = fut.result()
+                # 결과는 메인 스레드에서만 쓰므로 잠금이 필요 없다
                 rec = {"key": target_key(t), "text": text, "model": model, "usage": usage}
-                with _lock:
-                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    out.flush()
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                out.flush()
                 n_ok += 1
             except Exception as e:
                 n_err += 1
@@ -207,14 +194,9 @@ def merge():
             pos = sum(1 for b in r["blocks"] if b["bbox"][1] <= t["bbox"][1])
             r["blocks"].insert(pos, block)
         # [3] 다시 쓰기
-        tmp = path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, path)
+        save_records(path, records)
 
-    summaries = [s for s in (write_preview(f) for f in sorted(JSONL_DIR.rglob("*.jsonl"))) if s]
-    write_index(summaries)
+    refresh_previews()
     print(f"JSONL 반영: {len(by_file)}개 파일 / 미리보기 갱신 완료")
 
 

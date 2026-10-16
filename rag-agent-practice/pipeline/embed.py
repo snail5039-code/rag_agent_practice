@@ -15,7 +15,7 @@
      │       (메타데이터는 clean_meta()로 Chroma가 받는 형식만 남김, 실패하면 쉬었다가 재시도)
      └─ --query 있으면 search(): 질문을 임베딩해 가장 가까운 청크 k개 출력 (거리 작을수록 비슷)
 
-    get_store()는 evaluate_retrievers.py에서도 같은 컬렉션을 열 때 쓴다.
+    get_store()는 retriever.py에서도 같은 컬렉션을 열 때 쓴다.
 
 실행
     python -m pipeline.embed                         # output/chunks/base_300_50 -> 컬렉션 base_300_50
@@ -48,12 +48,12 @@ BATCH = 100
 
 
 def get_store(collection):
-    """임베딩 모델 + Chroma 컬렉션(코사인 거리)을 연다. (벡터스토어, 클라이언트) 반환."""
+    """임베딩 모델 + Chroma 컬렉션(코사인 거리)을 연다."""
     load_dotenv(BASE_DIR / ".env", override=True)
     embeddings = GoogleGenerativeAIEmbeddings(model=os.getenv("EMBEDDING_MODEL", EMBEDDING_MODEL))
     client = chromadb.PersistentClient(path=str(VECTORDB_DIR))
     return Chroma(collection_name=collection, embedding_function=embeddings, client=client,
-                  collection_metadata={"hnsw:space": "cosine"}), client
+                  collection_metadata={"hnsw:space": "cosine"})
 
 
 def clean_meta(meta, chunk_id):
@@ -67,7 +67,7 @@ def embed(config):
     """청킹 설정 이름(예: base_300_50)의 청크를 같은 이름의 컬렉션에 임베딩·저장한다."""
     # [1] 청크 읽기 / [2] 컬렉션 열기
     chunks = [json.loads(l) for l in (CHUNK_DIR / config / "chunks.jsonl").open(encoding="utf-8")]
-    store, _ = get_store(config)
+    store = get_store(config)
     # [3] 저장된 것과 비교: 새 청크·본문이 바뀐 청크만 임베딩, 바뀌거나 없어진 청크는 먼저 지운다
     #     (추출을 일부 고친 뒤 다시 청킹해도 바뀐 것만 다시 임베딩하면 된다)
     saved = store.get(include=["documents"])
@@ -106,7 +106,7 @@ def embed(config):
 
 def search(config, query, k):
     """저장된 컬렉션으로 유사도 검색 결과를 출력한다 (동작 확인용)."""
-    store, _ = get_store(config)
+    store = get_store(config)
     for doc, dist in store.similarity_search_with_score(query, k=k):
         m = doc.metadata
         print(f"[{dist:.3f}] {m['file_name']} p.{m['page_no']} ({m['content_type']}) {m['chunk_id']}")

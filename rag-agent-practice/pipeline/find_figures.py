@@ -35,13 +35,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
-import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pdfplumber
 
-from pipeline.extract import DATA_DIR, JSONL_DIR, MARGIN, OUT_DIR, inside, load_records
+from pipeline.extract import DATA_DIR, JSONL_DIR, OUT_DIR, body_box, inside, jsonl_files, load_records
 
 FIG_DIR = OUT_DIR / "figures"
 LAYOUT_DPI = 150
@@ -49,8 +48,7 @@ CROP_DPI = 200
 MIN_SCORE = 0.5
 MIN_AREA = 0.02        # 페이지 면적의 2% 미만 영역(아이콘 등)은 제외
 MIN_DIAGRAM_TEXT = 4   # image 영역 안 글자 상자가 이보다 적으면 사진·로고로 본다
-
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
+KINDS = ("chart", "diagram", "table", "ocr_failed")
 
 _models = None
 
@@ -93,11 +91,8 @@ def table_is_broken(t):
     return any(all(not row[c] for row in t["rows"]) for c in range(cols)) if t["rows"] else True
 
 
-def body_box(page):
-    """extract.py와 같은 여백을 뺀 본문 영역"""
-    w, h = page.width, page.height
-    return (page.bbox[0] + w * MARGIN["left"], page.bbox[1] + h * MARGIN["top"],
-            page.bbox[2] - w * MARGIN["right"], page.bbox[3] - h * MARGIN["bottom"])
+def count_kinds(targets):
+    return {k: sum(t["kind"] == k for t in targets) for k in KINDS}
 
 
 def find_in_file(jsonl_file):
@@ -189,26 +184,21 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
 
-    files = sorted(JSONL_DIR.rglob("*.jsonl"))
-    if args.only:
-        files = [f for f in files if args.only in f.name]
-
+    files = jsonl_files(args.only)
     all_targets = []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(find_in_file, f) for f in files]
         for i, fut in enumerate(as_completed(futures), start=1):
             name, targets = fut.result()
             all_targets += targets
-            kinds = {k: sum(t["kind"] == k for t in targets) for k in ("chart", "diagram", "table", "ocr_failed")}
-            print(f"[{i}/{len(files)}] {name} - {kinds}", flush=True)
+            print(f"[{i}/{len(files)}] {name} - {count_kinds(targets)}", flush=True)
 
     all_targets.sort(key=lambda t: (t["jsonl"], t["page_no"], t["figure_id"]))
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     with (FIG_DIR / "targets.jsonl").open("w", encoding="utf-8") as f:
         for t in all_targets:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-    total = {k: sum(t["kind"] == k for t in all_targets) for k in ("chart", "diagram", "table", "ocr_failed")}
-    print(f"전체 {len(all_targets)}개: {total}")
+    print(f"전체 {len(all_targets)}개: {count_kinds(all_targets)}")
 
 
 if __name__ == "__main__":

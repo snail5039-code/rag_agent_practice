@@ -95,7 +95,7 @@ class Retriever:
         self.rows = load_chunk_rows(config)
         self.by_id = {r["chunk_id"]: r for r in self.rows}
         # [2] 벡터DB / [3] BM25 색인
-        self.store, _ = get_store(config)
+        self.store = get_store(config)
         self.bm25_index = BM25Search(self.rows)
 
     def _docs(self, docs):

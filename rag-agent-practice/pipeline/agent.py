@@ -30,9 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
+import logging
 import os
 import time
 import uuid
+import warnings
 from datetime import datetime
 from typing import Literal, Optional
 
@@ -44,7 +46,12 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from pipeline.extract import BASE_DIR
-from pipeline.retriever import DOMAINS, Retriever
+from pipeline.retriever import Retriever
+
+# 결과와 상관없는 라이브러리 경고를 끈다 (aim-ai-agent-my 10번 스크립트의 quiet_library_noise와 같은 방식)
+# - gemini-3.x는 temperature를 무시한다는 경고, google-genai의 API 키·AFC·function_call 안내 로그
+warnings.filterwarnings("ignore", message=r"Model .* uses fixed sampling defaults", category=UserWarning)
+logging.getLogger("google_genai").setLevel(logging.ERROR)
 
 RUNS_DIR = BASE_DIR / "output" / "runs"
 DEFAULT_MODEL = "gemini-3.6-flash"

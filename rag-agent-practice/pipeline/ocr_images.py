@@ -11,11 +11,7 @@
 흐름
     main()
      ├─ jsonl 파일마다 병렬로 process_file()
-     │   └─ process_file(): 페이지의 이미지 블록 중 대상만 처리
-     │       대상 = (needs_vision 이고 아직 OCR 안 한 블록) + (OCR은 했는데 표 감지는 안 한 블록)
-     │       ├─ 이미 OCR한 블록: 저장된 PNG로 find_image_tables()만 돌려서
-     │       │                    표가 없으면 그대로 두고, 표가 있으면 ocr_region()으로 다시 처리
-     │       └─ 새 블록: ocr_region()
+     │   └─ process_file(): needs_vision 이고 아직 OCR 안 한 이미지 블록마다 ocr_region()
      │           [1] 영역을 200dpi로 렌더링 -> PNG 저장 (output/extracted/images/)
      │           [2] find_image_tables(): 레이아웃 모델로 표 영역 찾기 -> 표만 잘라 OCR
      │               -> 표 구조 모델로 행·열 복원(html_to_rows) -> 1행/1열·빈칸 많은 표 거르기
@@ -29,7 +25,7 @@
      └─ 미리보기·INDEX 다시 생성
 
 실행
-    python -m pipeline.ocr_images               # 전체 (이미 OCR한 블록은 표 감지만 추가로 한다)
+    python -m pipeline.ocr_images               # 전체 (이미 OCR한 블록은 건너뛴다)
     python -m pipeline.ocr_images --only luxury # 파일명 일부로 골라서
 """
 
@@ -40,18 +36,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
-import json
 import logging
-import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pdfplumber
 from bs4 import BeautifulSoup
-from PIL import Image
 
-from pipeline.extract import (DATA_DIR, JSONL_DIR, OUT_DIR, inside, is_real_table, layout_from_words,
-                     load_records, markdown_row, reading_key, write_index, write_preview)
+from pipeline.extract import (DATA_DIR, OUT_DIR, inside, is_real_table, jsonl_files, layout_from_words,
+                              load_records, markdown_table, reading_key, refresh_previews, save_records)
 
 IMAGES_DIR = OUT_DIR / "images"
 DPI = 200
@@ -61,8 +54,6 @@ OCR_METHOD = "rapidocr-ppocrv5-korean"
 MIN_TABLE_SCORE = 0.5  # 레이아웃 모델의 표 신뢰도 하한
 MIN_TABLE_FILL = 0.5   # 데이터 행의 채워진 칸 비율 하한 (이보다 낮으면 구조 인식 실패로 본다)
 
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
-
 _engine = None
 _layout = None
 _table = None
@@ -70,7 +61,6 @@ _table = None
 
 def get_engine():
     """RapidOCR(PP-OCRv5 한국어) 엔진. 프로세스마다 한 번만 만든다."""
-    # 프로세스마다 한 번만 모델을 올린다
     global _engine
     if _engine is None:
         from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
@@ -150,26 +140,23 @@ def find_image_tables(img, bbox, page_chars):
         cells = [c for row in rows[1:] for c in row]
         if sum(1 for c in cells if c) / len(cells) < MIN_TABLE_FILL:
             continue
-        lines = [markdown_row(rows[0]), markdown_row(["---"] * len(rows[0]))]
-        lines += [markdown_row(r) for r in rows[1:]]
         tables.append({
             "px_box": (x0, y0, x1, y1),
             "bbox": [round(v, 1) for v in pdf_box],
             "layout_score": round(float(score), 3),
             "headers": rows[0],
             "rows": rows[1:],
-            "text": "\n".join(lines),
+            "text": markdown_table(rows[0], rows[1:]),
         })
     return tables
 
 
-def ocr_region(page, bbox, png_path, page_chars, image=None):
+def ocr_region(page, bbox, png_path, page_chars):
     """bbox 영역을 렌더링·저장하고 OCR한다. 읽기 순서로 정렬한 텍스트(표는 마크다운)와 통계를 반환."""
-    # [1] 렌더링·PNG 저장 (이미 저장된 PNG를 받으면 그대로 쓴다)
-    if image is None:
-        image = page.crop(bbox).to_image(resolution=DPI).original.convert("RGB")
-        png_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(png_path)
+    # [1] 렌더링·PNG 저장
+    image = page.crop(bbox).to_image(resolution=DPI).original.convert("RGB")
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(png_path)
     img = np.array(image)
 
     # [2] 이미지 속 표 찾기·복원
@@ -245,27 +232,16 @@ def process_file(jsonl_file):
 
     with pdfplumber.open(pdf_path) as pdf:
         for r in records:
-            # 새로 OCR할 블록 + 예전에 OCR만 하고 표 감지는 안 한 블록
-            targets = [b for b in r["blocks"] if b["content_type"] == "image" and (
-                (b.get("needs_vision") and "ocr_method" not in b)
-                or ("ocr_method" in b and not b.get("table_checked")))]
+            targets = [b for b in r["blocks"] if b["content_type"] == "image"
+                       and b.get("needs_vision") and "ocr_method" not in b]
             if not targets:
                 continue
             page = pdf.pages[r["page_no"] - 1]
             page_chars = [c for c in page.chars if not c["text"].startswith("(cid:")]
             for b in targets:
                 broken = b.get("full_page_reason") == "broken_font"
-                chars = [] if broken else page_chars
                 png_path = img_dir / f"{b['image_id']}.png"
-                image = None
-                if "ocr_method" in b:
-                    # 이미 OCR한 블록: 표가 없으면 기존 결과를 그대로 두고, 있을 때만 다시 OCR
-                    image = Image.open(png_path).convert("RGB")
-                    if not find_image_tables(np.array(image), tuple(b["bbox"]), chars):
-                        b["table_checked"] = True
-                        b["ocr_stats"]["tables"] = 0
-                        continue
-                text, stats, tables = ocr_region(page, tuple(b["bbox"]), png_path, chars, image)
+                text, stats, tables = ocr_region(page, tuple(b["bbox"]), png_path, [] if broken else page_chars)
                 b["text"] = text
                 b["image_path"] = png_path.relative_to(OUT_DIR).as_posix()
                 b["ocr_method"] = OCR_METHOD
@@ -284,11 +260,7 @@ def process_file(jsonl_file):
                 done += 1
                 n_tables += len(tables)
 
-    tmp = jsonl_file.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(tmp, jsonl_file)
+    save_records(jsonl_file, records)
     return first["file_name"], done, n_tables
 
 
@@ -299,18 +271,14 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
 
-    files = sorted(JSONL_DIR.rglob("*.jsonl"))
-    if args.only:
-        files = [f for f in files if args.only in f.name]
-
+    files = jsonl_files(args.only)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(process_file, f) for f in files]
         for i, fut in enumerate(as_completed(futures), start=1):
             name, done, n_tables = fut.result()
-            print(f"[{i}/{len(files)}] {name} - 다시 OCR {done}곳, 표 {n_tables}개", flush=True)
+            print(f"[{i}/{len(files)}] {name} - OCR {done}곳, 표 {n_tables}개", flush=True)
 
-    summaries = [s for s in (write_preview(f) for f in sorted(JSONL_DIR.rglob("*.jsonl"))) if s]
-    write_index(summaries)
+    refresh_previews()
     print("미리보기 갱신 완료")
 
 

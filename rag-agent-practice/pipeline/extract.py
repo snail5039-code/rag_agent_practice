@@ -24,8 +24,8 @@
      │           [7] 페이지 유형(text/mixed/scan/empty) 판정 -> dict 반환
      └─ write_preview()로 파일별 미리보기 md, write_index()로 INDEX.md 생성
 
-    다른 단계에서 가져다 쓰는 것: load_records, write_preview, write_index, markdown_row,
-    inside, is_real_table, layout_from_words, reading_key, MARGIN, 경로 상수들
+    다른 단계에서 가져다 쓰는 것: load_records, save_records, jsonl_files, refresh_previews, body_box,
+    markdown_row, markdown_table, inside, is_real_table, layout_from_words, reading_key, 경로 상수들
 
 실행
     python -m pipeline.extract                 # data/ 아래 모든 PDF 추출 (이어서 실행 가능)
@@ -53,7 +53,7 @@ PREVIEW_DIR = OUT_DIR / "preview"
 # 여백 경계에 걸친 글자도 버리도록 crop 대신 within_bbox(완전히 안에 있는 것만) 사용
 MARGIN = {"top": 0.06, "bottom": 0.07, "left": 0.03, "right": 0.03}
 MIN_IMAGE_AREA_RATIO = 0.10
-FOOTNOTE_PREFIXES = ("*", "※", "주:", "주)", "자료:", "출처:", "(주)", "* ")
+FOOTNOTE_PREFIXES = ("*", "※", "주:", "주)", "자료:", "출처:", "(주)")
 FOOTNOTE_GAP = 25  # 표 하단에서 이 거리(pt) 안에서 시작하는 각주만 표에 붙인다
 MIN_TABLE_TEXT_RATIO = 0.7  # 표로 읽은 글자가 표 영역 실제 글자의 70% 미만이면 깨진 표로 보고 텍스트로 읽는다
 
@@ -69,6 +69,12 @@ def normalize_cell(value):
 def markdown_row(values):
     """셀 목록 -> 마크다운 표 한 줄. 셀 안의 | 는 이스케이프한다."""
     return "| " + " | ".join(v.replace("|", r"\|") for v in values) + " |"
+
+
+def markdown_table(headers, rows):
+    """헤더 + 데이터 행 -> 마크다운 표 문자열"""
+    lines = [markdown_row(headers), markdown_row(["---"] * len(headers))]
+    return "\n".join(lines + [markdown_row(r) for r in rows])
 
 
 def clean_rows(raw_rows):
@@ -101,9 +107,7 @@ def table_to_markdown(rows):
         elif any(row[1:]):
             row[0] = current_first
         body.append(row)
-    lines = [markdown_row(headers), markdown_row(["---"] * len(headers))]
-    lines += [markdown_row(r) for r in body]
-    return headers, body, "\n".join(lines)
+    return headers, body, markdown_table(headers, body)
 
 
 def find_footnotes(lines, table_bbox):
@@ -127,11 +131,6 @@ def inside(obj, bbox):
     cx = (obj["x0"] + obj["x1"]) / 2
     cy = (obj["top"] + obj["bottom"]) / 2
     return bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]
-
-
-def detect_columns(page):
-    """페이지 단어로 2단 편집인지 판단한다 (layout_from_words 참고)."""
-    return layout_from_words(page.extract_words(), page.bbox)
 
 
 def layout_from_words(words, bbox, min_words=40):
@@ -218,16 +217,17 @@ def read_lines(page, layout):
     return lines
 
 
+def body_box(page):
+    """가장자리 여백(MARGIN)을 뺀 본문 영역 (x0, top, x1, bottom)"""
+    w, h = page.width, page.height
+    return (page.bbox[0] + w * MARGIN["left"], page.bbox[1] + h * MARGIN["top"],
+            page.bbox[2] - w * MARGIN["right"], page.bbox[3] - h * MARGIN["bottom"])
+
+
 def extract_page(page, page_no):
     """한 페이지 -> {페이지 정보, blocks: [text/table/image 블록]} (흐름은 파일 맨 위 [1]~[7])"""
     # [1] 여백 잘라내기
-    w, h = page.width, page.height
-    crop_box = (
-        page.bbox[0] + w * MARGIN["left"],
-        page.bbox[1] + h * MARGIN["top"],
-        page.bbox[2] - w * MARGIN["right"],
-        page.bbox[3] - h * MARGIN["bottom"],
-    )
+    crop_box = body_box(page)
     # 여백 제거 + 굵은 글씨용 중복 글자 제거
     body = page.within_bbox(crop_box).dedupe_chars()
     # 폰트에 글자 매핑이 없으면 "(cid:123)"으로 나온다 -> 텍스트에서는 빼고, 비율이 높으면 페이지를 이미지 처리 대상으로
@@ -279,14 +279,14 @@ def extract_page(page, page_no):
     text_page = body.filter(
         lambda o: o.get("object_type") != "char" or not any(inside(o, b) for b in table_boxes)
     )
-    layout = detect_columns(text_page)
+    layout = layout_from_words(text_page.extract_words(), text_page.bbox)  # 2단 편집 감지
     positioned = [
         {"content_type": "text", "text": l["text"], "bbox": (l["x0"], l["top"], l["x1"], l["bottom"])}
         for l in read_lines(text_page, layout)
     ]
 
     # [4] 이미지 후보 (면적 10% 초과) ----
-    page_area = w * h
+    page_area = page.width * page.height
     images = []
     # 페이지 전체를 덮는 스캔 이미지는 여백까지 걸쳐 있어 body에서 빠지므로 원본 페이지에서 찾고 여백 안쪽으로 자른다
     for i_idx, img in enumerate(page.images, start=1):
@@ -444,11 +444,7 @@ def refresh_table_pages(jsonl_file):
             records[i] = {**r, **{k: v for k, v in new.items() if k != "blocks"}, "blocks": blocks}
             changed.append(r["page_no"])
     if changed:
-        tmp = jsonl_file.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, jsonl_file)
+        save_records(jsonl_file, records)
     return first["file_name"], changed
 
 
@@ -457,6 +453,20 @@ def load_records(jsonl_file):
     with jsonl_file.open(encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
     return sorted(records, key=lambda r: r["page_no"])
+
+
+def save_records(jsonl_file, records):
+    """페이지 dict 목록 -> JSONL. tmp 파일에 다 쓴 뒤 교체해서 중간에 끊겨도 원본이 깨지지 않게 한다."""
+    tmp = jsonl_file.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, jsonl_file)
+
+
+def jsonl_files(only=None):
+    """추출 JSONL 목록. only를 주면 파일명에 그 문자열이 들어간 것만"""
+    return [f for f in sorted(JSONL_DIR.rglob("*.jsonl")) if not only or only in f.name]
 
 
 def write_preview(jsonl_file):
@@ -546,6 +556,11 @@ def write_index(summaries):
     (OUT_DIR / "INDEX.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def refresh_previews():
+    """모든 JSONL로 파일별 미리보기와 INDEX.md를 다시 만든다 (각 단계 끝에서 호출)"""
+    write_index([s for s in (write_preview(f) for f in jsonl_files()) if s])
+
+
 def main():
     """PDF 목록 -> 병렬 추출 -> 미리보기·INDEX 생성"""
     parser = argparse.ArgumentParser()
@@ -562,9 +577,7 @@ def main():
         pdfs = [p for p in pdfs if args.only in p.name]
 
     if args.refresh_tables:
-        for f in sorted(JSONL_DIR.rglob("*.jsonl")):
-            if args.only and args.only not in f.name:
-                continue
+        for f in jsonl_files(args.only):
             name, changed = refresh_table_pages(f)
             if changed:
                 print(f"{name}: 깨진 표가 있던 {len(changed)}쪽 다시 추출 {changed}", flush=True)
@@ -577,8 +590,7 @@ def main():
                 total, new = fut.result()
                 print(f"[{i}/{len(pdfs)}] {pdf_path.parent.name}/{pdf_path.name} - {total}쪽 (새로 추출 {new})", flush=True)
 
-    summaries = [s for s in (write_preview(f) for f in sorted(JSONL_DIR.rglob("*.jsonl"))) if s]
-    write_index(summaries)
+    refresh_previews()
     print(f"미리보기: {PREVIEW_DIR}  /  목록: {OUT_DIR / 'INDEX.md'}")
 
 
