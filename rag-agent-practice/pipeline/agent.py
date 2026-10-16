@@ -62,6 +62,15 @@ MAX_SEARCHES = 3
 # p1: 처음 프롬프트 / p2: is_table 제거, 계산·질문 부분·조건 일치 규칙 추가, judgement를 status보다 먼저
 PROMPT_VERSION = "p2"
 
+# 에이전트와 기본 RAG가 같이 쓰는 답변 규칙
+ANSWER_RULES = """[답변]
+- 검색 결과에 있는 내용만으로 한국어로 답한다. 추측하거나 문서 밖 지식을 보태지 않는다.
+- 질문의 모든 부분에 답한다. 계산했으면 계산에 쓴 수치와 결과를 함께 쓴다.
+- 수치는 연도·대상·단위가 질문과 같은 것을 쓴다 (비슷한 다른 연도·다른 대상의 수치와 헷갈리지 않는다).
+- citations에는 실제로 답에 쓴 근거만 넣는다: chunk_id, file_name, page_no, quote(검색 결과 원문 그대로 짧게).
+- judgement에 근거가 충분/부족한 이유를 먼저 쓰고, 그 판단에 맞게 status를 정한다.
+"""
+
 SYSTEM_PROMPT = f"""너는 한국어 PDF 문서(금융·공공·커머스·법률·의료)에 근거해서만 답하는 RAG 에이전트다.
 
 [검색]
@@ -76,12 +85,23 @@ SYSTEM_PROMPT = f"""너는 한국어 PDF 문서(금융·공공·커머스·법�
   문서에 비교·결론 문장이 따로 없다는 이유만으로 보류하지 않는다.
 - {MAX_SEARCHES}번 검색해도 근거가 없으면 지어내지 말고 status="withheld"로 답변을 보류한다.
 
-[답변]
-- 검색 결과에 있는 내용만으로 한국어로 답한다. 추측하거나 문서 밖 지식을 보태지 않는다.
-- 질문의 모든 부분에 답한다. 계산했으면 계산에 쓴 수치와 결과를 함께 쓴다.
-- 수치는 연도·대상·단위가 질문과 같은 것을 쓴다 (비슷한 다른 연도·다른 대상의 수치와 헷갈리지 않는다).
-- citations에는 실제로 답에 쓴 근거만 넣는다: chunk_id, file_name, page_no, quote(검색 결과 원문 그대로 짧게).
-- judgement에 근거가 충분/부족한 이유를 먼저 쓰고, 그 판단에 맞게 status를 정한다.
+{ANSWER_RULES}"""
+
+# 기본 RAG(비교용): 검색 결과를 미리 넣어 주고 한 번에 답하게 한다. 근거 판단·답변 규칙은 에이전트와 같고 재검색만 없다
+BASIC_RAG_PROMPT = """너는 한국어 PDF 문서(금융·공공·커머스·법률·의료)에 근거해서만 답하는 RAG 어시스턴트다.
+아래 검색 결과만 보고 답한다. 다시 검색할 수 없다.
+
+[근거 판단]
+- 질문이 여러 부분(예: 목적과 활동, 금액과 변화율)이면 부분마다 근거가 있는지 따로 확인한다.
+- 표·그래프의 수치로 차이·증감률·순위·비교를 계산할 수 있으면 근거가 있는 것으로 본다.
+  문서에 비교·결론 문장이 따로 없다는 이유만으로 보류하지 않는다.
+- 검색 결과에 근거가 없으면 지어내지 말고 status="withheld"로 답변을 보류한다.
+
+""" + ANSWER_RULES + """
+질문: {question}
+
+검색 결과:
+{context}
 """
 
 
@@ -98,6 +118,12 @@ class Answer(BaseModel):
     status: Literal["answered", "withheld"] = Field(description="answered=답변, withheld=근거 부족으로 보류")
     answer: str = Field(description="한국어 답변. 보류면 근거를 찾지 못했다는 안내")
     citations: list[Citation] = Field(default_factory=list, description="답에 쓴 근거")
+
+
+def chunk_records(chunks):
+    """검색 결과 -> 실행 기록용 청크 목록. 앞뒤 청크를 붙였으면(chunk_ids) LLM이 실제로 본 청크를 모두 남긴다"""
+    return [{"chunk_id": cid, **{k: c[k] for k in ("file_name", "page_no", "content_type")}}
+            for c in chunks for cid in c.get("chunk_ids", [c["chunk_id"]])]
 
 
 def format_results(chunks):
@@ -130,10 +156,7 @@ class RagAgent:
                 domain: finance, public, commerce, law, medical 중 하나. 애매하면 비워 둔다
             """
             chunks = retriever.search(query, domain=domain)
-            # 앞뒤 청크를 붙였으면(chunk_ids) LLM이 실제로 본 청크를 모두 기록한다
-            artifact = [{"chunk_id": cid, **{k: c[k] for k in ("file_name", "page_no", "content_type")}}
-                        for c in chunks for cid in c.get("chunk_ids", [c["chunk_id"]])]
-            return format_results(chunks), artifact
+            return format_results(chunks), chunk_records(chunks)
 
         # [3] 에이전트: 검색 툴 + 검색 3회 제한 + 구조화 출력
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -151,31 +174,58 @@ class RagAgent:
         # [1] 실행
         state = self.agent.invoke({"messages": [{"role": "user", "content": question}]})
         elapsed = time.time() - t0
-        answer = state.get("structured_response")
-        # [2] 검색 기록
-        searches = extract_searches(state["messages"])
-        # [3] 결과 저장
-        result = {
-            "run_id": uuid.uuid4().hex[:12],
-            "time": datetime.now().isoformat(timespec="seconds"),
-            "mode": "agent",
-            "model": self.model_name,
-            "retriever_config": self.config,
-            "question": question,
-            "status": answer.status if answer else "error",
-            "answer": answer.answer if answer else "",
-            "judgement": answer.judgement if answer else "",
-            "citations": [c.model_dump() for c in answer.citations] if answer else [],
-            "n_searches": sum(1 for s in searches if not s.get("blocked")),
-            "searches": searches,
-            "retrieved_chunk_ids": sorted({cid for s in searches for cid in s.get("chunk_ids", [])}),
-            "elapsed_sec": round(elapsed, 2),
-        }
-        if save:
-            RUNS_DIR.mkdir(parents=True, exist_ok=True)
-            with (RUNS_DIR / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
-        return result
+        # [2] 검색 기록 / [3] 결과 저장
+        return make_result("agent", self, question, state.get("structured_response"),
+                           extract_searches(state["messages"]), elapsed, save)
+
+
+class BasicRag:
+    """기본 RAG (에이전트와 비교용): 질문 그대로 한 번만 검색하고 바로 답변/보류한다.
+    검색기·모델·답변 형식(Answer)·답변 규칙은 RagAgent와 같고, 재검색과 검색어 고르기만 없다."""
+
+    def __init__(self, config=DEFAULT_CONFIG, k=5, model=None, **retriever_options):
+        load_dotenv(BASE_DIR / ".env", override=True)
+        self.model_name = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+        self.config = config
+        self.retriever = Retriever(config=config, k=k, **retriever_options)
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        llm = ChatGoogleGenerativeAI(model=self.model_name, timeout=120, max_retries=2)
+        self.llm = llm.with_structured_output(Answer)
+
+    def ask(self, question, save=True):
+        t0 = time.time()
+        chunks = self.retriever.search(question)  # 질문 그대로, 분야 지정 없이 한 번
+        answer = self.llm.invoke(BASIC_RAG_PROMPT.format(question=question, context=format_results(chunks)))
+        records = chunk_records(chunks)
+        searches = [{"query": question, "is_table": False, "domain": None, "blocked": False,
+                     "chunk_ids": [c["chunk_id"] for c in records],
+                     "pages": [f"{c['file_name']} p.{c['page_no']}" for c in records]}]
+        return make_result("rag", self, question, answer, searches, time.time() - t0, save)
+
+
+def make_result(mode, runner, question, answer, searches, elapsed, save):
+    """실행 결과 dict (에이전트·기본 RAG 공통). save면 output/runs/agent_runs.jsonl에 한 줄 저장"""
+    result = {
+        "run_id": uuid.uuid4().hex[:12],
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "mode": mode,
+        "model": runner.model_name,
+        "retriever_config": runner.config,
+        "question": question,
+        "status": answer.status if answer else "error",
+        "answer": answer.answer if answer else "",
+        "judgement": answer.judgement if answer else "",
+        "citations": [c.model_dump() for c in answer.citations] if answer else [],
+        "n_searches": sum(1 for s in searches if not s.get("blocked")),
+        "searches": searches,
+        "retrieved_chunk_ids": sorted({cid for s in searches for cid in s.get("chunk_ids", [])}),
+        "elapsed_sec": round(elapsed, 2),
+    }
+    if save:
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        with (RUNS_DIR / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    return result
 
 
 def extract_searches(messages):
