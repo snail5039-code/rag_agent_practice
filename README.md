@@ -153,6 +153,54 @@ flowchart LR
 
 <br>
 
+## 결과물 둘러보기
+
+### 예시: 차트 이미지 → 검색할 수 있는 표
+
+<img src="rag-agent-practice/output/extracted/figures/commerce/MezzoMedia%20%EC%82%B0%EC%97%85%20%EB%B3%B4%EA%B3%A0%EC%84%9C%20e%EC%BB%A4%EB%A8%B8%EC%8A%A4/page-4-fig-1.png" width="480" alt="이커머스 디지털 광고비 차트">
+
+```markdown
+### [차트] 이커머스 디지털 광고비 증감 추이
+- 출처: 리서치애드, 2022 / 단위: 억, %
+
+| 연도 | 배너 (비중) | 동영상 (비중) | 총 광고비 | 전년대비 증감률 |
+| --- | --- | --- | --- | --- |
+| 2019 | 76% | 24% | 3,237억 | [표기 없음] |
+| 2020 | 75% | 25% | 3,513억 | 9% |
+| 2021 | 74% | 26% | 4,743억 | 35% |
+```
+
+글자로 된 PDF 텍스트에는 이 숫자들이 없다. 차트를 찾아 Gemini로 표로 바꿔야 "2021년 이커머스 광고비는?" 같은 질문에 답할 수 있다.
+
+### 추출
+| 보기 | 파일 |
+|---|---|
+| 59개 PDF 추출 결과 목록 (쪽 유형·표·이미지 수) | [INDEX.md](rag-agent-practice/output/extracted/INDEX.md) |
+| 차트가 많은 보고서 (원본 이미지 + 변환 결과) | [MezzoMedia e커머스 보고서](<rag-agent-practice/output/extracted/preview/commerce/MezzoMedia 산업 보고서 e커머스.md>) |
+| 표가 많은 자료집 (PDF 표 + 이미지 속 표) | [한-호주 퇴직연금 포럼](<rag-agent-practice/output/extracted/preview/finance/한-호주 퇴직연금 포럼_책자(최종).md>) |
+
+### 청킹 (최종 500/60)
+| 보기 | 파일 |
+|---|---|
+| 청크 수·길이 통계 (문서 유형·콘텐츠 종류·분야별) | [STATS.md](rag-agent-practice/output/chunks/base_500_60/STATS.md) |
+| 표를 행 단위로 자르고 헤더를 반복한 예 | [한-호주 퇴직연금 포럼 청크](<rag-agent-practice/output/chunks/base_500_60/preview/finance/한-호주 퇴직연금 포럼_책자(최종).md>) |
+| 차트 하나를 한 청크로 만든 예 | [MezzoMedia 청크](<rag-agent-practice/output/chunks/base_500_60/preview/commerce/MezzoMedia 산업 보고서 e커머스.md>) |
+| 비교용 청킹 통계 | [300/50](rag-agent-practice/output/chunks/base_300_50/STATS.md) · [800/100](rag-agent-practice/output/chunks/base_800_100/STATS.md) |
+
+### 평가 보고서
+| 보기 | 파일 |
+|---|---|
+| 최종 에이전트 (분야별·근거 유형별 점수, 실패 사례) | [report.md](rag-agent-practice/output/eval/agent/goldenset_200__base_500_60__gemini-3.5-flash-lite__nb1_hybrid_fb_p2/report.md) |
+| 같은 조건의 기본 RAG | [report.md](rag-agent-practice/output/eval/agent/goldenset_200__base_500_60__gemini-3.5-flash-lite__nb1_hybrid_fb_p2_rag/report.md) |
+| RAGAS 실패 원인 분석 (검색 / 판단 / 지어냄 / 근거 읽기) | [report.md](rag-agent-practice/output/eval/ragas/goldenset_200__base_500_60__gemini-3.5-flash-lite/report.md) |
+| agentevals 검색 과정 채점 | [report.md](rag-agent-practice/output/eval/trajectory/goldenset_200__base_500_60__gemini-3.5-flash-lite/report.md) |
+| 검색기 비교 (309문제) | [report.md](rag-agent-practice/output/eval/retrieval/goldenset_all__base_500_60/report.md) |
+
+> 결과 폴더 이름 규칙: `<골든셋>__<청킹>__<모델>__<검색 설정>_<프롬프트>`.
+> 검색 설정 표시가 없는 폴더는 개선 전 검색 방식의 결과다.
+
+<br>
+
 ## 실행 방법
 
 ```bash
