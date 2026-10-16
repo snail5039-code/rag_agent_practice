@@ -1,6 +1,6 @@
 """RAG 에이전트 (LangChain create_agent)
 
-- 검색 툴 search(query, is_table, domain): 표 질문이면 전체 청크 MMR, 아니면 Hybrid (retriever.py)
+- 검색 툴 search(query, domain): Hybrid + 앞뒤 청크 + 분야 보완 (retriever.py)
 - 근거 판단: 검색 결과로 답할 수 있는지 LLM이 판단하고 이유를 judgement에 남긴다
 - 재검색: 부족하면 검색어를 바꿔 다시 검색. 검색은 최초 포함 최대 3회 (ToolCallLimitMiddleware로 강제)
 - 보류: 3번 검색해도 근거가 없으면 status="withheld"
@@ -58,25 +58,30 @@ RUNS_DIR = BASE_DIR / "output" / "runs"
 # 3.6-flash·2.5-flash·2.5-flash-lite와 비교해 가장 빠르고(질문당 약 4초) 재검색·보류도 제대로 해서 선택
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 MAX_SEARCHES = 3
+# 프롬프트를 바꾸면 올린다 (평가 결과 폴더 이름에 들어가 결과끼리 섞이지 않게)
+# p1: 처음 프롬프트 / p2: is_table 제거, 계산·질문 부분·조건 일치 규칙 추가, judgement를 status보다 먼저
+PROMPT_VERSION = "p2"
 
 SYSTEM_PROMPT = f"""너는 한국어 PDF 문서(금융·공공·커머스·법률·의료)에 근거해서만 답하는 RAG 에이전트다.
 
 [검색]
 - 답하기 전에 반드시 search 툴로 문서를 검색한다. 검색은 최초 포함 최대 {MAX_SEARCHES}번까지만 할 수 있다.
-- 질문이 표에 정리된 수치·항목·비교(예: 연도별 금액, 항목별 비율, A와 B의 차이)를 묻는 것 같으면 is_table=true,
-  그 밖의 설명·정의·배경·절차 질문이면 is_table=false로 검색한다.
 - 분야가 확실하면 domain(finance, public, commerce, law, medical)을 지정하고, 애매하면 비워 둔다.
 
 [근거 판단]
-- 검색 결과를 읽고 질문에 답할 근거가 충분한지 판단한다.
-- 부족하면 검색어를 바꿔 다시 검색한다: 핵심어만 남기기, 동의어·문서에 나올 법한 표현으로 바꾸기,
-  domain을 지정했다면 풀기, is_table을 바꿔 보기.
+- 질문이 여러 부분(예: 목적과 활동, 금액과 변화율)이면 부분마다 근거가 있는지 따로 확인한다.
+- 부족한 부분이 있으면 그 부분을 찾도록 검색어를 바꿔 다시 검색한다: 핵심어만 남기기,
+  동의어·문서에 나올 법한 표현으로 바꾸기, domain을 지정했다면 풀기.
+- 표·그래프의 수치로 차이·증감률·순위·비교를 계산할 수 있으면 근거가 있는 것으로 본다.
+  문서에 비교·결론 문장이 따로 없다는 이유만으로 보류하지 않는다.
 - {MAX_SEARCHES}번 검색해도 근거가 없으면 지어내지 말고 status="withheld"로 답변을 보류한다.
 
 [답변]
 - 검색 결과에 있는 내용만으로 한국어로 답한다. 추측하거나 문서 밖 지식을 보태지 않는다.
+- 질문의 모든 부분에 답한다. 계산했으면 계산에 쓴 수치와 결과를 함께 쓴다.
+- 수치는 연도·대상·단위가 질문과 같은 것을 쓴다 (비슷한 다른 연도·다른 대상의 수치와 헷갈리지 않는다).
 - citations에는 실제로 답에 쓴 근거만 넣는다: chunk_id, file_name, page_no, quote(검색 결과 원문 그대로 짧게).
-- judgement에는 근거가 충분/부족하다고 판단한 이유를 한두 문장으로 쓴다.
+- judgement에 근거가 충분/부족한 이유를 먼저 쓰고, 그 판단에 맞게 status를 정한다.
 """
 
 
@@ -88,9 +93,10 @@ class Citation(BaseModel):
 
 
 class Answer(BaseModel):
+    # 필드 순서대로 생성되므로 근거 판단(judgement)을 먼저 쓰고 그에 맞춰 status를 정하게 한다
+    judgement: str = Field(description="질문의 부분마다 근거가 충분/부족한지와 그 이유")
     status: Literal["answered", "withheld"] = Field(description="answered=답변, withheld=근거 부족으로 보류")
     answer: str = Field(description="한국어 답변. 보류면 근거를 찾지 못했다는 안내")
-    judgement: str = Field(description="근거가 충분/부족하다고 판단한 이유")
     citations: list[Citation] = Field(default_factory=list, description="답에 쓴 근거")
 
 
@@ -116,15 +122,14 @@ class RagAgent:
         retriever = self.retriever
 
         @tool(response_format="content_and_artifact")
-        def search(query: str, is_table: bool = False, domain: Optional[str] = None):
+        def search(query: str, domain: Optional[str] = None):
             """PDF 문서에서 질문의 근거를 검색한다.
 
             Args:
                 query: 검색어 (질문 그대로 또는 핵심어)
-                is_table: 표에 정리된 수치·항목·비교를 묻는 질문이면 true (MMR 검색), 아니면 false (Hybrid 검색)
                 domain: finance, public, commerce, law, medical 중 하나. 애매하면 비워 둔다
             """
-            chunks = retriever.search(query, is_table=is_table, domain=domain)
+            chunks = retriever.search(query, domain=domain)
             # 앞뒤 청크를 붙였으면(chunk_ids) LLM이 실제로 본 청크를 모두 기록한다
             artifact = [{"chunk_id": cid, **{k: c[k] for k in ("file_name", "page_no", "content_type")}}
                         for c in chunks for cid in c.get("chunk_ids", [c["chunk_id"]])]

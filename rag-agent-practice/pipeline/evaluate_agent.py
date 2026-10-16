@@ -26,7 +26,7 @@ aim-ai-agent-my 30번 노트북(langgraph-evaluation)과 같은 구조:
   (3.6-flash·3.5-flash-lite·2.5-flash·2.5-flash-lite 모두 맞은 답 8개·틀린 답 4개를 12/12로 판정 -> 가장 빠른 것)
 
 결과: output/eval/agent/<골든셋>__<청킹설정>__<모델>__<검색설정>/details.jsonl (문제별), report.md (요약·실패 사례)
-     검색설정 예: nb1_hybrid_fb = 앞뒤 청크 1개 + 표도 Hybrid + 분야 결과에 전체 결과 섞기 (기본)
+     검색설정 예: nb1_hybrid_fb_p2 = 앞뒤 청크 1개 + 표도 Hybrid + 분야 결과에 전체 결과 섞기 + 프롬프트 p2 (기본)
 
 흐름
     main()
@@ -45,7 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import json
 
-from pipeline.agent import DEFAULT_MODEL, RagAgent
+from langsmith import tracing_context
+
+from pipeline.agent import DEFAULT_MODEL, PROMPT_VERSION, RagAgent
 from pipeline.chunk import DEFAULT_CONFIG
 from pipeline.evaluate_retrievers import load_golden, norm_name
 from pipeline.extract import BASE_DIR
@@ -184,9 +186,9 @@ def main():
     if args.limit:
         golden = golden[:args.limit]
 
-    # 예: goldenset_200__base_500_60__gemini-3.5-flash-lite__nb1_hybrid_fb
-    # (검색 설정 표시가 없는 옛 폴더는 앞뒤 청크 없음·표 MMR·분야 필터만 쓰던 처음 검색 방식의 결과)
-    search_opts = f"nb{args.neighbors}_{args.table_mode}" + ("_fb" if args.domain_fallback else "")
+    # 예: goldenset_200__base_500_60__gemini-3.5-flash-lite__nb1_hybrid_fb_p2 (검색 설정 + 프롬프트 버전)
+    # 검색 설정 표시가 없는 옛 폴더는 처음 검색 방식(앞뒤 청크 없음·표 MMR·분야 필터), 프롬프트 표시가 없으면 p1
+    search_opts = f"nb{args.neighbors}_{args.table_mode}" + ("_fb" if args.domain_fallback else "") + f"_{PROMPT_VERSION}"
     out_dir = EVAL_DIR / (f"{golden_path.stem}__{args.config}__{args.model}__{search_opts}"
                           + (f"__{args.tag}" if args.tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -209,8 +211,11 @@ def main():
                                      "target_answer", "answerable")}
             row["gold"] = sorted(f"{f} p.{p}" for f, p in q["gold"])
             try:
-                run = agent.ask(q["question"], save=False)
-                correct, comment = evaluate_answer(judge, q, run)
+                # .env의 LANGSMITH_TRACING이 켜져 있어도 평가 중에는 LangSmith로 실행 기록을 보내지 않는다
+                # (문제마다 호출이 많아 무료 사용량을 금방 넘고, 평가 결과는 details.jsonl에 따로 남는다)
+                with tracing_context(enabled=False):
+                    run = agent.ask(q["question"], save=False)
+                    correct, comment = evaluate_answer(judge, q, run)
                 row.update({k: run[k] for k in ("status", "answer", "judgement", "citations", "n_searches",
                                                 "searches", "retrieved_chunk_ids", "elapsed_sec", "model")})
                 row.update({"correct": correct, "judge_comment": comment,
