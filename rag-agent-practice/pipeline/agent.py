@@ -105,12 +105,12 @@ def format_results(chunks):
 
 
 class RagAgent:
-    def __init__(self, config=DEFAULT_CONFIG, k=5, model=None):
+    def __init__(self, config=DEFAULT_CONFIG, k=5, model=None, **retriever_options):
         load_dotenv(BASE_DIR / ".env", override=True)
         self.model_name = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
         self.config = config
-        # [1] 검색기
-        self.retriever = Retriever(config=config, k=k)
+        # [1] 검색기 (retriever_options: neighbors, table_mode, domain_fallback -> Retriever 참고)
+        self.retriever = Retriever(config=config, k=k, **retriever_options)
 
         # [2] 검색 툴 (본문은 LLM에게, 청크 목록은 artifact로 실행 기록에)
         retriever = self.retriever
@@ -125,7 +125,9 @@ class RagAgent:
                 domain: finance, public, commerce, law, medical 중 하나. 애매하면 비워 둔다
             """
             chunks = retriever.search(query, is_table=is_table, domain=domain)
-            artifact = [{k: c[k] for k in ("chunk_id", "file_name", "page_no", "content_type")} for c in chunks]
+            # 앞뒤 청크를 붙였으면(chunk_ids) LLM이 실제로 본 청크를 모두 기록한다
+            artifact = [{"chunk_id": cid, **{k: c[k] for k in ("file_name", "page_no", "content_type")}}
+                        for c in chunks for cid in c.get("chunk_ids", [c["chunk_id"]])]
             return format_results(chunks), artifact
 
         # [3] 에이전트: 검색 툴 + 검색 3회 제한 + 구조화 출력

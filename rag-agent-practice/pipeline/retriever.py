@@ -6,10 +6,10 @@
 - bm25      : Kiwi 형태소 토큰 + BM25Okapi
 - hybrid    : similarity·bm25 각각 fetch_k개를 RRF(순위 합산)로 합쳐 k개
 
-에이전트 검색 규칙 (검색 평가 267문제 결과로 결정)
-- 표 질문이면 전체 청크 대상 MMR  (표 질문 48개: MMR hit@5 0.979 / MRR 0.856 으로 가장 좋음)
-- 아니면 Hybrid                    (전체 hit@5 0.944 / MRR 0.839 로 가장 좋음)
-- domain을 주면 그 분야 청크 안에서만 찾는다
+에이전트 검색 규칙
+- Hybrid로 k개 찾기 (처음에는 표 질문만 MMR이었지만 실패 분석 후 표도 Hybrid로 바꿈 - Retriever 옵션 참고)
+- domain을 주면 그 분야 결과와 전체 결과를 RRF로 섞는다
+- 찾은 청크마다 같은 쪽의 앞뒤 청크 1개씩을 붙여서 넘긴다
 
 흐름
     Retriever(config)
@@ -17,7 +17,9 @@
      [2] Chroma 컬렉션 열기(embed.get_store) -> similarity, mmr
      [3] BM25Search로 전체 청크 색인 (Kiwi 형태소, vectordb/bm25_<설정>.pkl에 저장해 두고 재사용)
     Retriever.search(query, is_table, domain, k)
-     -> is_table이면 mmr(), 아니면 hybrid() -> 청크 dict 목록 (chunk_id, 파일명, 쪽, 본문 ...)
+     [1] hybrid() (table_mode="mmr"이고 표 질문이면 mmr())
+     [2] domain_fallback: 분야 결과 + 전체 결과를 RRF로
+     [3] with_neighbors(): 앞뒤 청크를 붙여 한 덩어리로 -> 청크 dict 목록 (chunk_id, chunk_ids, 파일명, 쪽, 본문 ...)
 
 실행 (동작 확인용)
     python -m pipeline.retriever "보험업권 상생금융이 뭐야?"
@@ -102,9 +104,33 @@ def load_chunk_rows(config):
     return rows
 
 
+def chunk_pos(chunk_id):
+    """"domain/stem/p003/c02" -> ("domain/stem/p003", 2): 같은 쪽 안에서 몇 번째 청크인지"""
+    prefix, idx = chunk_id.rsplit("/c", 1)
+    return prefix, int(idx)
+
+
+def join_overlap(a, b, max_overlap=100):
+    """이어진 두 청크를 합친다. 청킹 겹침(overlap)으로 b 앞부분이 a 끝과 같으면 한 번만 쓴다."""
+    for n in range(min(len(a), len(b), max_overlap), 0, -1):
+        if a.endswith(b[:n]):
+            return a + b[n:]
+    return a + "\n" + b
+
+
 class Retriever:
-    def __init__(self, config=DEFAULT_CONFIG, k=5, fetch_k=20):
+    """검색기. 옵션 (RAGAS·agentevals 실패 분석으로 추가, 200문제 정답률 0.827·0.811 -> 0.872)
+    - neighbors      : 찾은 청크마다 같은 쪽의 앞뒤 청크를 n개씩 붙여 한 덩어리로 넘긴다 (0이면 안 붙임)
+                       -> 쪽은 찾았는데 답이 적힌 청크가 빠지는 문제 대응
+    - table_mode     : 표 질문 검색 방식 "mmr" 또는 "hybrid"
+                       -> MMR은 같은 표의 행 청크를 하나만 가져와서 표 질문 정답률이 낮았음 (0.55 -> 0.67)
+    - domain_fallback: domain을 지정해도 전체 검색 결과를 RRF로 섞는다
+                       -> 분야를 잘못 고르면 정답률 0.3 수준이었음
+    """
+
+    def __init__(self, config=DEFAULT_CONFIG, k=5, fetch_k=20, neighbors=1, table_mode="hybrid", domain_fallback=True):
         self.k, self.fetch_k = k, fetch_k
+        self.neighbors, self.table_mode, self.domain_fallback = neighbors, table_mode, domain_fallback
         # [1] 청크 읽기
         self.rows = load_chunk_rows(config)
         self.by_id = {r["chunk_id"]: r for r in self.rows}
@@ -131,11 +157,43 @@ class Retriever:
     def hybrid(self, query, k, domain=None):
         return rrf(self.similarity(query, self.fetch_k, domain), self.bm25(query, self.fetch_k, domain), top=k)
 
+    def with_neighbors(self, hits, n):
+        """찾은 청크마다 같은 쪽의 앞뒤 n개를 붙인다. 겹치거나 이어지는 구간은 한 덩어리로 합치고,
+        덩어리 순서는 그 안에서 가장 순위가 높은 청크 기준. 덩어리의 chunk_id·출처는 그 청크를 따른다."""
+        spans = {}   # 쪽 -> 붙일 청크 번호들
+        best = {}    # (쪽, 청크 번호) -> 검색 순위
+        for rank, hit in enumerate(hits):
+            prefix, idx = chunk_pos(hit["chunk_id"])
+            best[(prefix, idx)] = rank
+            spans.setdefault(prefix, set()).update(
+                j for j in range(idx - n, idx + n + 1) if f"{prefix}/c{j:02d}" in self.by_id)
+
+        blocks = []
+        for prefix, nums in spans.items():
+            run = []
+            for j in sorted(nums) + [None]:  # None: 마지막 구간을 내보내기 위한 표시
+                if run and (j is None or j != run[-1] + 1):
+                    ranked = [(best[(prefix, x)], x) for x in run if (prefix, x) in best]
+                    rank, hit_idx = min(ranked)
+                    ids = [f"{prefix}/c{x:02d}" for x in run]
+                    text = self.by_id[ids[0]]["text"]
+                    for cid in ids[1:]:
+                        text = join_overlap(text, self.by_id[cid]["text"])
+                    blocks.append((rank, {**self.by_id[f"{prefix}/c{hit_idx:02d}"], "text": text, "chunk_ids": ids}))
+                    run = []
+                if j is not None:
+                    run.append(j)
+        return [b for _, b in sorted(blocks, key=lambda x: x[0])]
+
     def search(self, query, is_table=False, domain=None, k=None):
-        """에이전트 검색: 표 질문이면 MMR, 아니면 Hybrid"""
+        """에이전트 검색: 표 질문이면 table_mode(기본 MMR), 아니면 Hybrid (+ 옵션: 분야 보완, 앞뒤 청크)"""
         k = k or self.k
         domain = domain if domain in DOMAINS else None
-        return self.mmr(query, k, domain) if is_table else self.hybrid(query, k, domain)
+        find = self.mmr if is_table and self.table_mode == "mmr" else self.hybrid
+        hits = find(query, k, domain)
+        if domain and self.domain_fallback:
+            hits = rrf(hits, find(query, k, None), top=k)
+        return self.with_neighbors(hits, self.neighbors) if self.neighbors else hits
 
 
 def main():

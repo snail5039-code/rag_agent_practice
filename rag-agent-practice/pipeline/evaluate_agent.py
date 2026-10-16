@@ -18,13 +18,15 @@ aim-ai-agent-my 30번 노트북(langgraph-evaluation)과 같은 구조:
     python -m pipeline.evaluate_agent --ids my-03,gs-010   # 특정 문제만
     python -m pipeline.evaluate_agent --fresh              # 처음부터 다시
     python -m pipeline.evaluate_agent --model gemini-3.6-flash   # 문제 푸는 모델 바꾸기 (채점 모델은 그대로)
+    python -m pipeline.evaluate_agent --neighbors 0 --table-mode mmr --no-domain-fallback   # 처음 검색 방식
 
 모델
 - 문제 푸는 모델: --model (기본은 agent.py의 DEFAULT_MODEL)
 - 채점 모델: JUDGE_MODEL로 고정. 실험끼리 공정하게 비교하려면 채점 기준이 같아야 하기 때문
   (3.6-flash·3.5-flash-lite·2.5-flash·2.5-flash-lite 모두 맞은 답 8개·틀린 답 4개를 12/12로 판정 -> 가장 빠른 것)
 
-결과: output/eval/agent/<골든셋>__<청킹설정>__<모델>/details.jsonl (문제별), report.md (요약·실패 사례)
+결과: output/eval/agent/<골든셋>__<청킹설정>__<모델>__<검색설정>/details.jsonl (문제별), report.md (요약·실패 사례)
+     검색설정 예: nb1_hybrid_fb = 앞뒤 청크 1개 + 표도 Hybrid + 분야 결과에 전체 결과 섞기 (기본)
 
 흐름
     main()
@@ -167,6 +169,11 @@ def main():
     parser.add_argument("--fresh", action="store_true", help="이전 결과를 지우고 처음부터")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="문제 푸는 모델 (채점 모델은 JUDGE_MODEL로 고정)")
     parser.add_argument("--tag", help="같은 설정을 한 번 더 돌릴 때 결과 폴더 뒤에 붙일 이름 (예: run2)")
+    # 검색 옵션 (retriever.Retriever 참고). 결과 폴더 이름에 들어가서 설정끼리 섞이지 않는다
+    parser.add_argument("--neighbors", type=int, default=1, help="찾은 청크의 앞뒤 청크를 몇 개씩 붙일지")
+    parser.add_argument("--table-mode", choices=["mmr", "hybrid"], default="hybrid", help="표 질문 검색 방식")
+    parser.add_argument("--no-domain-fallback", dest="domain_fallback", action="store_false",
+                        help="분야를 지정하면 그 분야 안에서만 검색 (기본은 전체 결과도 섞음)")
     args = parser.parse_args()
 
     # [1] 골든셋
@@ -177,7 +184,11 @@ def main():
     if args.limit:
         golden = golden[:args.limit]
 
-    out_dir = EVAL_DIR / (f"{golden_path.stem}__{args.config}__{args.model}" + (f"__{args.tag}" if args.tag else ""))
+    # 예: goldenset_200__base_500_60__gemini-3.5-flash-lite__nb1_hybrid_fb
+    # (검색 설정 표시가 없는 옛 폴더는 앞뒤 청크 없음·표 MMR·분야 필터만 쓰던 처음 검색 방식의 결과)
+    search_opts = f"nb{args.neighbors}_{args.table_mode}" + ("_fb" if args.domain_fallback else "")
+    out_dir = EVAL_DIR / (f"{golden_path.stem}__{args.config}__{args.model}__{search_opts}"
+                          + (f"__{args.tag}" if args.tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
     details = out_dir / "details.jsonl"
     if args.fresh:
@@ -190,7 +201,8 @@ def main():
 
     # [3] 풀고 채점 -> 한 줄씩 바로 저장 (중간에 끊겨도 다시 실행하면 이어서)
     if todo:
-        agent = RagAgent(config=args.config, model=args.model)
+        agent = RagAgent(config=args.config, model=args.model, neighbors=args.neighbors,
+                         table_mode=args.table_mode, domain_fallback=args.domain_fallback)
         judge = make_answer_judge()
         for i, q in enumerate(todo, start=1):
             row = {k: q[k] for k in ("qid", "domain", "context_type", "source", "question",
