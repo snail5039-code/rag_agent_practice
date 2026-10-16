@@ -18,7 +18,7 @@
     get_store()는 retriever.py에서도 같은 컬렉션을 열 때 쓴다.
 
 실행
-    python -m pipeline.embed                         # output/chunks/base_300_50 -> 컬렉션 base_300_50
+    python -m pipeline.embed                         # output/chunks/base_500_60 -> 컬렉션 base_500_60
     python -m pipeline.embed --config base_800_100
     python -m pipeline.embed --query "보험업권 상생금융이 뭐야?"   # 저장된 컬렉션으로 검색 확인
 """
@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-from pipeline.chunk import CHUNK_DIR
+from pipeline.chunk import CHUNK_DIR, DEFAULT_CONFIG
 from pipeline.extract import BASE_DIR
 
 VECTORDB_DIR = BASE_DIR / "vectordb"
@@ -116,7 +116,7 @@ def search(config, query, k):
 def main():
     """--query가 있으면 검색, 없으면 임베딩"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="base_300_50")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--query")
     parser.add_argument("--k", type=int, default=5)
     args = parser.parse_args()

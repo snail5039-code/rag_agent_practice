@@ -39,7 +39,7 @@ from collections import defaultdict
 
 from rank_bm25 import BM25Okapi
 
-from pipeline.chunk import CHUNK_DIR
+from pipeline.chunk import CHUNK_DIR, DEFAULT_CONFIG
 from pipeline.embed import VECTORDB_DIR, get_store
 
 RRF_C = 60  # RRF 상수 (순위 1등 = 1/61)
@@ -103,7 +103,7 @@ def load_chunk_rows(config):
 
 
 class Retriever:
-    def __init__(self, config="base_300_50", k=5, fetch_k=20):
+    def __init__(self, config=DEFAULT_CONFIG, k=5, fetch_k=20):
         self.k, self.fetch_k = k, fetch_k
         # [1] 청크 읽기
         self.rows = load_chunk_rows(config)

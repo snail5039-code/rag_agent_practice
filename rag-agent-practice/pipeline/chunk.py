@@ -32,7 +32,7 @@
      └─ write_stats()로 STATS.md (유형·종류·분야별 개수·길이)
 
 실행
-    python -m pipeline.chunk                         # 기본 300/50 -> output/chunks/base_300_50/
+    python -m pipeline.chunk                         # 기본 500/60 -> output/chunks/base_500_60/
     python -m pipeline.chunk --size 800 --overlap 100
     python -m pipeline.chunk --with-header           # 청크 앞에 [파일명 | p.N] 붙이기 (설계 md의 '나중에 추가')
 """
@@ -54,6 +54,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pipeline.extract import BASE_DIR, jsonl_files, load_records, markdown_row, markdown_table
 
 CHUNK_DIR = BASE_DIR / "output" / "chunks"
+# 기본 청킹: 300/50·500/60·800/100 비교 결과 500/60 선택
+# (에이전트 정답률 2회 평균 0.819 vs 300/50 0.791, 검색 횟수·응답 시간도 더 적음)
+DEFAULT_SIZE, DEFAULT_OVERLAP = 500, 60
+DEFAULT_CONFIG = f"base_{DEFAULT_SIZE}_{DEFAULT_OVERLAP}"
 
 # 의학 학술지 논문 (2단·쪽당 2천자 이상 + 1단 논문 journal-31 + 스캔 논문 Kafm015)
 PAPER_FILES = {
@@ -363,8 +367,8 @@ def write_stats(out_dir, name, chunks):
 def main():
     """청크 크기·겹침을 받아 build() 실행"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--size", type=int, default=300)
-    parser.add_argument("--overlap", type=int, default=50)
+    parser.add_argument("--size", type=int, default=DEFAULT_SIZE)
+    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP)
     parser.add_argument("--with-header", action="store_true")
     args = parser.parse_args()
     out_dir, chunks = build(args.size, args.overlap, args.with_header)

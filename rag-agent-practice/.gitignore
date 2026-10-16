@@ -2,6 +2,7 @@
 data/*
 !data/goldenset_my.csv
 !data/goldenset_all.csv
+!data/goldenset_200.csv
 
 # 벡터DB (python -m pipeline.embed 로 다시 생성, 용량 큼)
 vectordb/

@@ -44,6 +44,7 @@ import argparse
 import json
 
 from pipeline.agent import DEFAULT_MODEL, RagAgent
+from pipeline.chunk import DEFAULT_CONFIG
 from pipeline.evaluate_retrievers import load_golden, norm_name
 from pipeline.extract import BASE_DIR
 
@@ -160,11 +161,12 @@ def load_done(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--golden", default="data/goldenset_all.csv")
-    parser.add_argument("--config", default="base_300_50")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--limit", type=int, help="앞에서부터 N문제만")
     parser.add_argument("--ids", help="풀 문제 id (쉼표로 구분)")
     parser.add_argument("--fresh", action="store_true", help="이전 결과를 지우고 처음부터")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="문제 푸는 모델 (채점 모델은 JUDGE_MODEL로 고정)")
+    parser.add_argument("--tag", help="같은 설정을 한 번 더 돌릴 때 결과 폴더 뒤에 붙일 이름 (예: run2)")
     args = parser.parse_args()
 
     # [1] 골든셋
@@ -175,7 +177,7 @@ def main():
     if args.limit:
         golden = golden[:args.limit]
 
-    out_dir = EVAL_DIR / f"{golden_path.stem}__{args.config}__{args.model}"
+    out_dir = EVAL_DIR / (f"{golden_path.stem}__{args.config}__{args.model}" + (f"__{args.tag}" if args.tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
     details = out_dir / "details.jsonl"
     if args.fresh:

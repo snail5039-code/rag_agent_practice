@@ -45,7 +45,8 @@ rag_agent_practice/
     │   │   ├─ images/          이미지 영역 PNG (OCR 대상)
     │   │   └─ figures/         그래프·다이어그램 PNG + Gemini 결과
     │   ├─ chunks/
-    │   │   └─ base_300_50/     chunks.jsonl, STATS.md, preview/
+    │   │   ├─ base_500_60/     기본(최종) - chunks.jsonl, STATS.md, preview/
+    │   │   └─ base_300_50/, base_800_100/   비교용
     │   ├─ experiments/        실험 결과
     │   └─ logs/               실행 로그
     │
@@ -61,7 +62,7 @@ python -m pipeline.extract         # 1. 글·표 추출 (이어서 실행 가능
 python -m pipeline.ocr_images      # 2. 이미지 OCR + 이미지 속 표
 python -m pipeline.find_figures    # 3. 그래프·다이어그램 찾기
 python -m pipeline.vision_gemini   # 4. Gemini 변환 (.env 필요)
-python -m pipeline.chunk           # 5. 청킹 → output/chunks/base_300_50/
+python -m pipeline.chunk           # 5. 청킹 → output/chunks/base_500_60/ (--size/--overlap로 변경)
 python -m pipeline.embed           # 6. 임베딩 → vectordb/ (.env 필요)
 python -m pipeline.evaluate_retrievers --golden data/goldenset_my.csv   # 7. 검색기 비교
 python -m pipeline.agent "질문" --show-searches                          # 8. 에이전트에 질문 하나
@@ -84,9 +85,21 @@ python -m pipeline.embed --query "보험업권 상생금융이 뭐야?" --k 5
 | 단계 | 상태 |
 |---|---|
 | 추출 (글·표·OCR·Gemini) | 완료 - 59개 PDF, 1,258쪽 |
-| 청킹 | 완료 - 300/50, 6,383개 |
-| 임베딩·벡터DB | 완료 - gemini-embedding-2, Chroma 컬렉션 `base_300_50` |
-| 골든셋 | 완료 - 내 골든셋 77문제, 합본 309문제 |
-| 검색기 비교 | 완료 - 표 질문=MMR, 나머지=Hybrid (표 버그 수정 전 데이터 기준) |
-| 에이전트 | 완료 - `pipeline/agent.py` |
-| 에이전트 평가 | 스크립트 완료 (`pipeline/evaluate_agent.py`), 실행 전 |
+| 청킹 | 완료 - 기본 500/60 (4,747개), 비교용 300/50 (6,382개)·800/100 (3,960개) |
+| 임베딩·벡터DB | 완료 - gemini-embedding-2, Chroma 컬렉션 `base_500_60`·`base_300_50`·`base_800_100` |
+| 골든셋 | 완료 - 내 골든셋 77문제, 합본 309문제, 비율 맞춰 뽑은 200문제 |
+| 검색기 비교 | 완료 - 표 질문=MMR, 나머지=Hybrid |
+| 에이전트 | 완료 - `pipeline/agent.py` (gemini-3.5-flash-lite) |
+| 에이전트 평가 | 완료 - 309문제 정답률 0.810 (300/50), 청킹 비교는 아래 |
+
+## 청킹 비교 (검색 방식 고정: 표=MMR, 나머지=Hybrid)
+
+| 청킹 | 검색 Hybrid MRR (309문제) | 에이전트 정답률 (200문제, 1차/2차) | 평균 검색 | 평균 시간 |
+|---|---|---|---|---|
+| 300/50 | **0.830** | 0.786 / 0.796 | 1.77회 | 4.1초 |
+| **500/60** | 0.819 | **0.827 / 0.811** | **1.60회** | **3.8초** |
+| 800/100 | 0.812 | 0.806 / - | 1.54회 | 3.9초 |
+
+- 검색 지표는 300/50이 가장 좋지만, 에이전트 정답률은 500/60이 두 번 모두 더 높아서 500/60 선택
+- 같은 설정을 두 번 돌려도 정답률이 1~2%p 흔들린다 (LLM 응답이 매번 조금씩 다름). 차이는 약 3%p로 작다
+- 표 질문 정답률은 세 설정 모두 0.55~0.61 -> 청킹으로는 해결되지 않음

@@ -45,6 +45,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from pipeline.chunk import DEFAULT_CONFIG
 from pipeline.extract import BASE_DIR
 from pipeline.retriever import Retriever
 
@@ -104,7 +105,7 @@ def format_results(chunks):
 
 
 class RagAgent:
-    def __init__(self, config="base_300_50", k=5, model=None):
+    def __init__(self, config=DEFAULT_CONFIG, k=5, model=None):
         load_dotenv(BASE_DIR / ".env", override=True)
         self.model_name = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
         self.config = config

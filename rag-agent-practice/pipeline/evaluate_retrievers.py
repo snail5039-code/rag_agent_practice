@@ -43,6 +43,7 @@ import re
 import time
 import unicodedata
 
+from pipeline.chunk import DEFAULT_CONFIG
 from pipeline.extract import BASE_DIR
 from pipeline.retriever import RRF_C, Retriever, rrf
 
@@ -143,7 +144,7 @@ def main():
     """골든셋 × 검색기 채점 -> 표 출력·보고서 저장"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--golden", default="data/golden_set.csv")
-    parser.add_argument("--config", default="base_300_50")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--strategies", default=",".join(STRATEGIES))
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--fetch-k", type=int, default=20)
