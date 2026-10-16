@@ -49,6 +49,8 @@
 python -m pipeline.agent "핀테크 혁신펀드 1호는 몇 년간 운용됐고 목표 금액과 실제 조성 금액은 얼마인가요?"
 ```
 
+아래는 에이전트의 **답변 출력**이다 (골든셋 형식이 아님).
+
 **근거가 있을 때** → 답변 + 출처(파일·쪽·원문)
 
 ```json
@@ -250,6 +252,22 @@ flowchart LR
 | 직접 작성 | 12 | PDF를 읽고 질문·정답·근거 쪽 작성 |
 | 의료 문서 질문 | 30 | 실제 환자가 물을 법한 말투로 작성 (답이 없는 질문 4개, 두 문서를 같이 봐야 하는 질문 1개 포함) |
 | **합계** | **309** | 겹치는 35문제는 한 번만 |
+
+**형식: CSV** (`data/goldenset_all.csv` 309문제, `data/goldenset_200.csv` 200문제, `data/goldenset_my.csv` 직접 작성분)
+
+제공 골든셋(`golden_set.csv`)의 6개 열에 7개 열을 더했다.
+
+| 열 | 내용 | 예 |
+|---|---|---|
+| `id` | 문제 번호 (제공 문제는 원래 행 번호를 딴 `gs-001`) | `my-01` |
+| `domain` | 분야 | `commerce` |
+| `question` / `target_answer` | 질문 / 기준 답변 | |
+| `evidence` | 근거 구절 (직접 작성분) | |
+| `target_file_name` / `target_page_no` | 정답 파일과 쪽. 여러 문서면 `A.pdf \|\| B.pdf`, `1 \|\| 13,14` | `10` |
+| `context_type` | 근거 유형: paragraph / table / image / text | `paragraph` |
+| `answerable` | 답이 문서에 있는지. `false`면 보류해야 정답 | `true` |
+| `question_type` / `difficulty` / `must_not` | 질문 유형, 난이도, 하면 안 되는 답 (직접 작성분) | |
+| `source` | 출처: `golden_set.csv` / `my` / `medical_v1` | `my` |
 
 - **검수**: 직접 쓴 문제는 정답 쪽을 PDF 추출 결과와 하나씩 대조해서 확인
 - **답이 없는 질문**: 약 가격, 금식 시간처럼 일반 지식으로 그럴듯하게 답할 수 있지만 문서에는 없는 질문 → 지어내는지 시험
